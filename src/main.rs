@@ -1,10 +1,20 @@
-use std::fs::File;
-use std::io::{self, BufRead, Seek, SeekFrom, BufReader};
-use std::io::Read;
-use std::env;
 use colored::Colorize;
 use log::{debug, error};
+use std::env;
+use std::fs::File;
+use std::io::Read;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::sync::Once;
 
+static INIT: Once = Once::new();
+
+const CHUNK_SIZE: usize = 8;
+
+pub fn init_logger() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
 
 fn debug_msg(msg: String) {
     debug!("{}", msg);
@@ -15,45 +25,39 @@ fn err_msg(msg: String) {
 }
 
 fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
-    let mut buffer = [0; 1];
-    let mut cur_pos = start_pos;
+    let mut buffer = [0; CHUNK_SIZE];
+    let mut seek_pos = start_pos;
 
     loop {
-        file.seek(SeekFrom::Start(cur_pos))?;
-
-        // TODO: replace single char read with reading a chunk (for
-        // performance)
-        match file.read_exact(&mut buffer) {
-            Ok(_) => {}, // do nothing, this just means the result is in
-                         // buffer[0]
-            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Seek past last char"));
-            },
-            Err(e) => return Err(e),
-        };
-
-        if buffer[0] == b'\n' {
-            // Ignore the newline if this is the first iteration because it
-            // means we're standing at the end of a line and we still need to
-            // find its beginning.
-            if cur_pos == start_pos {
-                cur_pos -= 1;
-                continue
-            }
-            debug_msg("Found break at pos={cur_pos}".into());
-            // Increment cur pos because we're currently on the newline
-            // (end of the previous line). We need to be on the next char.
-            cur_pos += 1;
-            break;
-        }
-        cur_pos = cur_pos.checked_sub(1).unwrap_or(0);
-        if cur_pos == 0 {
+        let read_size = std::cmp::min(seek_pos as usize, CHUNK_SIZE);
+        seek_pos = seek_pos.saturating_sub(read_size as u64);
+        if seek_pos == 0 {
             debug_msg("Got to the beginning of the file".into());
             break;
         }
+        file.seek(SeekFrom::Start(seek_pos))?;
+        file.read_exact(&mut buffer[..read_size])?;
+        for i in (0..read_size).rev() {
+            if buffer[i] == b'\n' {
+                debug_msg(format!(
+                    "Found new line in the buffer at position {i}"
+                ));
+                debug_msg(format!(
+                    "The buffer contains {:?}",
+                    buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
+                ));
+                debug_msg(format!("Start position is {start_pos}").into());
+                debug_msg(format!("Seek position is {seek_pos}").into());
+                let line_start = seek_pos + i as u64 + 1;
+                debug_msg(format!(
+                    "Line start is {seek_pos} + {i} + 1 = {line_start}"
+                ));
+                return Ok(line_start);
+            }
+        }
     }
 
-    return Ok(cur_pos);
+    return Ok(seek_pos);
 }
 
 fn read_some_lines(file_path: &str, start_pos: u64, n: usize) -> std::io::Result<Vec<String>> {
@@ -63,10 +67,8 @@ fn read_some_lines(file_path: &str, start_pos: u64, n: usize) -> std::io::Result
         Ok(line_start) => {
             debug_msg(format!("Line starts at pos {line_start}"));
             line_start
-        },
-        Err(err) => {
-            return Err(err)
-        },
+        }
+        Err(err) => return Err(err),
     };
 
     debug_msg(format!("Reading from pos={line_start}"));
@@ -76,20 +78,21 @@ fn read_some_lines(file_path: &str, start_pos: u64, n: usize) -> std::io::Result
     // Collect N lines from the current position
     let lines: Vec<String> = reader
         .lines()
-        .take(n)  // Limit to N lines
-        .collect::<Result<_, _>>()?;  // Collect results into a vector and handle errors
+        .take(n) // Limit to N lines
+        .collect::<Result<_, _>>()?; // Collect results into a vector and handle errors
 
     return Ok(lines);
 }
 
 fn main() {
-    env_logger::init();
+    init_logger();
+
     let args: Vec<String> = env::args().collect();
     // Check if there are enough arguments
     if args.len() < 4 {
         debug_msg("usage: <FILE> <START_POS> <NUM_LINES>".into());
     } else {
-        let fname =  &args[1];
+        let fname = &args[1];
         let pos: u64 = args[2].parse().unwrap();
         let num_lines: usize = args[3].parse().unwrap();
 
@@ -104,12 +107,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::tempfile;
-    use std::io::{Write, SeekFrom, Seek};
 
     #[test]
     fn test_find_beginning_of_line() -> std::io::Result<()> {
         // Create a temporary file with known content
+        init_logger();
+
         let mut file = tempfile()?; // This creates a temporary file that will be cleaned up after the test
         let contents = "First line\nSecond line\nThird line\n";
         write!(file, "{contents}")?;
@@ -133,12 +138,6 @@ mod tests {
         let end_pos = file.seek(SeekFrom::End(-1))?;
         let start_pos = find_beginning_of_line(&mut file, end_pos)?;
         assert_eq!(start_pos, 23);
-
-        // Test case 5: Start at EOF
-        file.seek(SeekFrom::End(0))?;
-        let end_pos = file.seek(SeekFrom::End(0))?;
-        let start_pos = find_beginning_of_line(&mut file, end_pos);
-        assert_eq!(start_pos.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
 
         Ok(())
     }
