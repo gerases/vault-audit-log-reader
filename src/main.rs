@@ -1,23 +1,17 @@
 use clap::{Arg, Command};
 use colored::Colorize;
-use dns_lookup::lookup_addr;
-use log::LevelFilter;
 use log::{debug, error, info};
 use num_cpus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::Once;
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
-
-type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
 
 static INIT: Once = Once::new();
 
@@ -32,35 +26,22 @@ const MIN_BYTES_PER_THREAD: u64 = 2_000;
 #[derive(Serialize, Deserialize, Debug)]
 struct Request<'a> {
     id: &'a str,
-    actor: &'a str,
-    time: &'a str,
+    // actor:          &'a str,
     path: &'a str,
     operation: &'a str,
-    clnt_tok: &'a str,
-    accsr_tok: &'a str,
-    tok_issue: &'a str,
-    tok_type: &'a str,
+    clnt_tok:       &'a str,
+    accsr_tok:      &'a str,
+    tok_issue:      &'a str,
     remote_address: &'a str,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Response<'a> {
-    remote_address: &'a str,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct LogEntry<'a> {
-    event_type: &'a str,
-    request: Request<'a>,
 }
 
 #[derive(Debug, Clone)]
 struct Cli {
     output_raw: bool,
     responses_only: bool,
-    // start_time: Option<String>,
-    // end_time: Option<String>,
-    track: Option<HashSet<String>>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    track: Option<Vec<String>>,
     single_thread: bool,
     log_file: String,
 }
@@ -70,6 +51,16 @@ macro_rules! debug_msg {
         let location = std::panic::Location::caller();
         debug!("{}:{}: {}", location.file(), location.line(), $msg);
     }};
+}
+
+pub fn init_logger() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
+
+fn ok_msg(msg: String) {
+    info!("{}", msg.green());
 }
 
 pub fn init_logger() {
@@ -88,70 +79,6 @@ fn ok_msg(msg: String) {
 
 fn err_msg(msg: String) {
     error!("ERROR: {}", msg.red());
-}
-
-fn actor(auth: &Value) -> String {
-    match auth.get("metadata") {
-        Some(value) => match value.get("role_name") {
-            Some(role_name) => role_name.as_str().unwrap().to_string(),
-            None => value.get("username").unwrap().as_str().unwrap().to_string(),
-        },
-        None => auth
-            .get("display_name")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string(),
-    }
-}
-
-fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
-    let hostname = lookup_addr(&ip)?;
-    Ok(hostname)
-}
-
-fn format_ipv4_addr(remote_addr: Option<&Value>) -> String {
-    match remote_addr {
-        Some(value) => match value.as_str() {
-            Some(addr_str) => {
-                let addr: IpAddr = addr_str.parse().unwrap_or_else(|error| {
-                    err_msg(format!("Couldn't parse '{addr_str}': {error}").into());
-                    "0.0.0.0".parse().unwrap()
-                });
-                match resolve_ip_to_hostname(addr) {
-                    Ok(hostname) => hostname,
-                    Err(_) => format!("Can't resolve '{}'", addr_str.to_string()),
-                }
-            }
-            None => String::from("Can't convert to string"),
-        },
-        None => String::from("Remote addr missing"),
-    }
-}
-
-fn format_hmacs(json_obj: &mut Value) {
-    match json_obj {
-        Value::Object(map) => {
-            for (_, val) in map.iter_mut() {
-                format_hmacs(val);
-            }
-        }
-        Value::Array(arr) => {
-            for val in arr.iter_mut() {
-                format_hmacs(val);
-            }
-        }
-        Value::String(s) => {
-            if s.starts_with(HMAC_PFX_LONG) {
-                let replaced = s.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
-                // the string 'hmac:' is 5 letters
-                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX_SHORT.len()).collect();
-            }
-        }
-        _ => {
-            // do nothing for everything else
-        }
-    }
 }
 
 fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
@@ -211,7 +138,7 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
     return Ok(seek_pos);
 }
 
-fn read_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Vec<String>> {
+fn filter_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
     let mut file = File::open(&cli_args.log_file)?;
 
     let line_start = match find_beginning_of_line(&mut file, range.start) {
@@ -229,7 +156,7 @@ fn read_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Ve
     let byte_limit: u64 = range.count().try_into().unwrap();
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
-    let lines: Vec<String> = reader
+    let lines: Vec<Value> = reader
         .lines()
         .take_while(|line| {
             if let Ok(ref line) = line {
@@ -242,7 +169,43 @@ fn read_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Ve
                 false
             }
         })
-        .collect::<Result<_, _>>()?;
+        .filter_map(|line| {
+            match line {
+                Ok(line) => match serde_json::from_str(&line) {
+                    Ok(json) => Some(json),
+                    Err(e) => {
+                        eprintln!("Failed to parse JSON: {}", e); // Log or handle the error
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to read line: {}", e); // Log or handle the error
+                    None
+                }
+            }
+        })
+        .filter(|json_value: &Value| {
+            let event_type = json_value.get("type").unwrap();
+            if cli_args.responses_only && event_type != "response" {
+                return false;
+            }
+
+            let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+
+            if cli_args.output_raw {
+                to_writer(&mut stdout, &json_value).unwrap();
+                return false;
+            }
+
+            let raw_auth = json_value.get("auth");
+            let raw_request = json_value.get("request");
+            let raw_response = json_value.get("response");
+
+            to_writer(&mut stdout, &json_value).unwrap();
+
+            return true;
+        })
+        .collect::<Vec<Value>>();
 
     Ok(lines)
 }
@@ -484,6 +447,119 @@ fn parse_args() -> Cli {
     }
 }
 
+fn process(cli_args: Cli) -> std::io::Result<()> {
+    let logical_cores = num_cpus::get();
+    let metadata = std::fs::metadata(&cli_args.log_file)?;
+    let file_size = metadata.len();
+    let num_threads = if cli_args.single_thread {
+        1
+    } else {
+        std::cmp::min(
+            (file_size / MIN_BYTES_PER_THREAD).max(1) as usize,
+            logical_cores,
+        )
+    };
+    debug_msg!(format!("Number of threads is {num_threads}"));
+    let ranges = split_into_ranges(file_size, num_threads);
+    let mut handles: Vec<JoinHandle<usize>> = vec![];
+    ranges.into_iter().for_each(|range| {
+        let cli_args = cli_args.clone();
+        let handle = std::thread::spawn(move || {
+            let thread_id = std::thread::current().id();
+            debug_msg!(format!(
+                "Thread={:?}; Processing range {:?}",
+                thread_id, range
+            ));
+            let result = filter_lines(&cli_args, range.clone());
+            let result = match result {
+                Ok(lines) => lines.len(),
+                Err(err) => {
+                    err_msg(format!(
+                        "can't process byte range {} thru {} of {}: {err}",
+                        range.start, range.end, cli_args.log_file
+                    ));
+                    0
+                }
+            };
+            result
+        });
+        handles.push(handle);
+    });
+
+    let thread_count = handles.len();
+    let sum: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+
+    ok_msg(format!("Count of threads: {}", thread_count));
+    ok_msg(format!("Count of lines: {}", sum));
+
+    Ok(())
+}
+
+fn parse_args() -> Cli {
+    let matches = Command::new("Read vault audit log")
+        .version("1.0")
+        .arg(
+            Arg::new("single-thread")
+                .short('S')
+                .long("single-thread")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to a single thread"),
+        )
+        .arg(
+            Arg::new("responses-only")
+                .short('R')
+                .long("responses-only")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to responses only"),
+        )
+        .arg(
+            Arg::new("track")
+                .short('t')
+                .long("track")
+                .help("HMAC values to track in the log")
+                .num_args(1..)
+                .value_name("HMAC"),
+        )
+        .arg(
+            Arg::new("start-time")
+                .short('s')
+                .long("start-time")
+                .help("Specify beginning time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("end-time")
+                .short('e')
+                .long("end-time")
+                .help("Specify end time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("raw")
+                .short('r')
+                .long("raw")
+                .action(clap::ArgAction::SetTrue)
+                .help("Print unabridged entries"),
+        )
+        .arg(
+            Arg::new("log_file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
+        )
+        .get_matches();
+
+    Cli {
+        log_file: matches.get_one::<String>("log_file").unwrap().clone(),
+        single_thread: matches.get_flag("single-thread"),
+        output_raw: matches.get_flag("raw"),
+        responses_only: matches.get_flag("responses-only"),
+        start_time: matches.get_one::<String>("start-time").cloned(),
+        end_time: matches.get_one::<String>("end-time").cloned(),
+        track: matches
+            .get_many::<String>("track")
+            .map(|values| values.cloned().collect()),
+    }
+}
+
 fn main() {
     init_logger();
     let args: Cli = parse_args();
@@ -530,8 +606,8 @@ mod tests {
         Ok(())
     }
 
-    fn assert_read_lines(cli: &Cli, range: std::ops::Range<u64>, expected: &[&str]) {
-        let result = read_lines(cli, range);
+    fn assert_filter_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
+        let result = filter_lines(file_path, range);
         match result {
             Ok(lines) => assert_eq!(lines, expected),
             Err(e) => panic!("Test failed with error: {:?}", e),
@@ -559,20 +635,24 @@ mod tests {
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
         // us the whole of the first line.
-        assert_read_lines(&cli, 0..1, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..1, &["First line"]);
 
         // Test case 3: start at byte 0 and request 11 bytes (up to and
         // including the \n of the first line). Should still give us the whole
         // of the first line.
-        assert_read_lines(&cli, 0..11, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..11, &["First line"]);
 
-        // // Test case 3: start at byte 0 and request 12 bytes (first byte of
-        // // line 2). Should still give us lin1 and line 2.
-        assert_read_lines(&cli, 0..12, &["First line", "Second line"]);
+        // Test case 3: start at byte 0 and request 12 bytes (first byte of
+        // line 2). Should still give us lin1 and line 2.
+        assert_filter_lines(
+            file.path().to_str().unwrap(),
+            0..12,
+            &["First line", "Second line"],
+        );
 
-        // // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
-        // // (well past the end of line 3). Should still give us all of line 3.
-        assert_read_lines(&cli, 30..130, &["Third line"]);
+        // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
+        // (well past the end of line 3). Should still give us all of line 3.
+        assert_filter_lines(file.path().to_str().unwrap(), 30..130, &["Third line"]);
 
         Ok(())
     }
@@ -587,124 +667,5 @@ mod tests {
         assert_eq!(split_into_ranges(0, 1), vec![]);
         assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
         assert_eq!(split_into_ranges(1, 3), vec![0..1]);
-    }
-
-    mod test_format_hmacs {
-        use super::*;
-
-        #[test]
-        fn test_format_hmacs_on_string() {
-            let mut json_value = json!("hmac-sha256:1234567890abcdef");
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!("hmac:1234567890"));
-        }
-
-        #[test]
-        fn test_format_hmacs_on_nested_object() {
-            let mut json_value = json!({
-                "key": "hmac-sha256:1234567890abcdef",
-                "nested": {
-                    "hmac": "hmac-sha256:abcdef1234567890"
-                }
-            });
-            format_hmacs(&mut json_value);
-            assert_eq!(
-                json_value,
-                json!({
-                    "key": "hmac:1234567890",
-                    "nested": {
-                        "hmac": "hmac:abcdef1234"
-                    }
-                })
-            );
-        }
-
-        #[test]
-        fn test_format_hmacs_on_array() {
-            let mut json_value = json!([
-                "hmac-sha256:abcdef1234567890",
-                "hmac-sha256:9876543210abcdef"
-            ]);
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!(["hmac:abcdef1234", "hmac:9876543210"]));
-        }
-
-        #[test]
-        fn test_format_hmacs_no_change_for_non_hmac_string() {
-            let mut json_value = json!("some other string");
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!("some other string"));
-        }
-
-        #[test]
-        fn test_format_hmacs_no_change_for_non_string_value() {
-            let mut json_value = json!(123);
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!(123));
-        }
-    }
-
-    mod test_track_hmacs {
-        use super::*;
-
-        #[test]
-        fn when_extra_tokens_present() {
-            let hmac_str = format!("{HMAC_PFX_LONG}:123456789");
-            let tracked_tok = format!("{hmac_str}a");
-            let json_value = json!({
-                "token": tracked_tok,
-                "accessor": format!("{hmac_str}b"),
-                "plaintext": format!("{hmac_str}c"),
-                "client_token_accessor": format!("{hmac_str}d"),
-                "key1": {
-                     "ciphertext": format!("{hmac_str}e"),
-                     "client_token": format!("{hmac_str}f")
-                }
-            });
-            let mut tracked_hmacs: HashSet<String> = HashSet::new();
-            tracked_hmacs.insert(tracked_tok.to_string());
-
-            // all of the HMACs should be found
-            let mut expected: HashSet<String> = HashSet::new();
-            ('a'..='f').for_each(|chr| {
-                let hmac_str = format!("{hmac_str}{chr}");
-                expected.insert(hmac_str.to_string());
-            });
-
-            track_hmacs(&json_value, &mut tracked_hmacs);
-            assert_eq!(tracked_hmacs, expected);
-        }
-
-        #[test]
-        fn when_nothing_extra_found() {
-            // This token is not related to any of the tokens in the request.
-            // So the tracked tokens set should not expand.
-            let tracked_tok = format!("hmac:abcdef");
-            let hmac_str = "hmac:123456789";
-            let json_value = json!({
-                "token": format!("{hmac_str}a"),
-                "accessor": format!("{hmac_str}b"),
-                "plaintext": format!("{hmac_str}c"),
-                "client_token_accessor": format!("{hmac_str}d"),
-                "key1": {
-                     "ciphertext": format!("{hmac_str}e"),
-                     "client_token": format!("{hmac_str}f")
-                }
-            });
-
-            let mut tracked_hmacs: HashSet<String> = HashSet::new();
-            tracked_hmacs.insert(tracked_tok.to_string());
-            track_hmacs(&json_value, &mut tracked_hmacs);
-
-            // all of the HMACs should be found
-            let mut expected: HashSet<String> = HashSet::new();
-            ('a'..='f').for_each(|chr| {
-                let hmac_str = format!("{hmac_str}{chr}");
-                expected.insert(hmac_str.to_string());
-            });
-
-            track_hmacs(&json_value, &mut tracked_hmacs);
-            assert_eq!(tracked_hmacs, [tracked_tok].into());
-        }
     }
 }
