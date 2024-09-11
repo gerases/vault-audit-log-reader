@@ -27,6 +27,27 @@ fn err_msg(msg: String) {
     error!("{}", msg.red());
 }
 
+fn split_into_ranges(n: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
+    let chunk_size: u64 = n / num_ranges as u64;
+    let remainder: u64 = n % num_ranges as u64;
+
+    if n == 0 || num_ranges == 0 {
+        return Vec::new(); // No ranges requested
+    }
+
+    (0..num_ranges)
+        .scan(0, |start, i| {
+            // Calculate the end of the current range
+            let end = *start + chunk_size + if i < remainder as usize { 1 } else { 0 };
+            // Create the range and update the start for the next iteration
+            let range = *start..end;
+            *start = end;  // Update the state (the starting point for the next range)
+            // Return the current range wrapped in Some, so it will be yielded
+            Some(range)
+        })
+        .collect()
+}
+
 fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
     let mut buffer = [0; CHUNK_SIZE];
     let mut seek_pos = start_pos;
@@ -61,12 +82,11 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
 
 fn read_some_lines(
     file_path: &str,
-    start_pos: u64,
-    byte_limit: u64,
+    range: std::ops::Range<u64>,
 ) -> std::io::Result<Vec<String>> {
     let mut file = File::open(file_path)?;
 
-    let line_start = match find_beginning_of_line(&mut file, start_pos) {
+    let line_start = match find_beginning_of_line(&mut file, range.start) {
         Ok(line_start) => {
             debug_msg!(format!("Line starts at pos {line_start}"));
             line_start
@@ -78,6 +98,7 @@ fn read_some_lines(
     file.seek(SeekFrom::Start(line_start))?;
     let reader = BufReader::new(file);
 
+    let byte_limit: u64 = range.count().try_into().unwrap();
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
     let lines: Vec<String> = reader
@@ -110,10 +131,10 @@ fn main() {
         debug_msg!("usage: <FILE> <START_POS> <NUM_BYTES>");
     } else {
         let fname = &args[1];
-        let pos: u64 = args[2].parse().unwrap();
+        let start_pos: u64 = args[2].parse().unwrap();
         let num_bytes: u64 = args[3].parse().unwrap();
 
-        let result = read_some_lines(fname, pos, num_bytes);
+        let result = read_some_lines(fname, start_pos..(start_pos + num_bytes));
         match result {
             Ok(lines) => println!("{:?}", lines),
             Err(err) => err_msg(format!("Couldn't find the beginning of the line: {err}")),
@@ -159,8 +180,8 @@ mod tests {
         Ok(())
     }
 
-    fn assert_read_some_lines(file_path: &str, start_pos: u64, byte_limit: u64, expected: &[&str]) {
-        let result = read_some_lines(file_path, start_pos, byte_limit);
+    fn assert_read_some_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
+        let result = read_some_lines(file_path, range);
         match result {
             Ok(lines) => assert_eq!(lines, expected),
             Err(e) => panic!("Test failed with error: {:?}", e),
@@ -177,25 +198,24 @@ mod tests {
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
         // us the whole of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0, 1 as u64, &["First line"]);
+        assert_read_some_lines(file.path().to_str().unwrap(), 0..1, &["First line"]);
 
         // Test case 2: start at byte 0 and request 11 bytes (up to and
         // including the \n of the first line). Should still give us the whole
         // of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0, 11, &["First line"]);
+        assert_read_some_lines(file.path().to_str().unwrap(), 0..11, &["First line"]);
 
         // Test case 3: start at byte 0 and request 12 bytes (first byte of
         // line 2). Should still give us lin1 and line 2.
         assert_read_some_lines(
             file.path().to_str().unwrap(),
-            0,
-            12,
+            0..12,
             &["First line", "Second line"],
         );
 
         // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
         // (well past the end of line 3). Should still give us all of line 3.
-        assert_read_some_lines(file.path().to_str().unwrap(), 30, 100, &["Third line"]);
+        assert_read_some_lines(file.path().to_str().unwrap(), 30..130, &["Third line"]);
 
         Ok(())
     }
