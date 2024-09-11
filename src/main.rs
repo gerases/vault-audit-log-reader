@@ -1,19 +1,43 @@
+use clap::{Arg, Command};
 use colored::Colorize;
-use log::{debug, error};
-use std::env;
+use log::{debug, error, info};
+use num_cpus;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::Once;
+use std::thread::JoinHandle;
+use termcolor::{ColorChoice, StandardStream};
+use termcolor_json::to_writer;
 
 static INIT: Once = Once::new();
 
 const CHUNK_SIZE: usize = 8;
+const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
-pub fn init_logger() {
-    INIT.call_once(|| {
-        env_logger::init();
-    });
+#[derive(Serialize, Deserialize, Debug)]
+struct Request<'a> {
+    id: &'a str,
+    // actor:          &'a str,
+    path: &'a str,
+    operation: &'a str,
+    clnt_tok:       &'a str,
+    accsr_tok:      &'a str,
+    tok_issue:      &'a str,
+    remote_address: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct Cli {
+    output_raw: bool,
+    responses_only: bool,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    track: Option<Vec<String>>,
+    single_thread: bool,
+    log_file: String,
 }
 
 macro_rules! debug_msg {
@@ -23,8 +47,43 @@ macro_rules! debug_msg {
     }};
 }
 
+pub fn init_logger() {
+    INIT.call_once(|| {
+        env_logger::init();
+    });
+}
+
+fn ok_msg(msg: String) {
+    info!("{}", msg.green());
+}
+
 fn err_msg(msg: String) {
-    error!("{}", msg.red());
+    error!("ERROR: {}", msg.red());
+}
+
+fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
+    if num_bytes == 0 || num_ranges == 0 {
+        return Vec::new(); // No ranges requested
+    }
+
+    let chunk_size: u64 = num_bytes / num_ranges as u64;
+    let remainder: u64 = num_bytes % num_ranges as u64;
+
+    (0..if num_bytes > num_ranges as u64 {
+        num_ranges
+    } else {
+        1
+    })
+        .scan(0, |start, i| {
+            // Calculate the end of the current range
+            let end = *start + chunk_size + if i < remainder as usize { 1 } else { 0 };
+            // Create the range and update the start for the next iteration
+            let range = *start..end;
+            *start = end; // Update the state (the starting point for the next range)
+                          // Return the current range wrapped in Some, so it will be yielded
+            Some(range)
+        })
+        .collect()
 }
 
 fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
@@ -59,14 +118,10 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
     return Ok(seek_pos);
 }
 
-fn read_some_lines(
-    file_path: &str,
-    start_pos: u64,
-    byte_limit: u64,
-) -> std::io::Result<Vec<String>> {
-    let mut file = File::open(file_path)?;
+fn filter_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
+    let mut file = File::open(&cli_args.log_file)?;
 
-    let line_start = match find_beginning_of_line(&mut file, start_pos) {
+    let line_start = match find_beginning_of_line(&mut file, range.start) {
         Ok(line_start) => {
             debug_msg!(format!("Line starts at pos {line_start}"));
             line_start
@@ -78,9 +133,10 @@ fn read_some_lines(
     file.seek(SeekFrom::Start(line_start))?;
     let reader = BufReader::new(file);
 
+    let byte_limit: u64 = range.count().try_into().unwrap();
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
-    let lines: Vec<String> = reader
+    let lines: Vec<Value> = reader
         .lines()
         .take_while(|line| {
             if let Ok(ref line) = line {
@@ -88,37 +144,170 @@ fn read_some_lines(
                     return false;
                 }
                 num_bytes_read += line.len() as u64 + 1;
-                debug_msg!(format!(
-                    "Read '{line}', bytes_read={num_bytes_read}, byte_limit={byte_limit}"
-                ));
                 true
             } else {
                 false
             }
         })
-        .collect::<Result<_, _>>()?; // Collect results into a vector and handle errors
+        .filter_map(|line| {
+            match line {
+                Ok(line) => match serde_json::from_str(&line) {
+                    Ok(json) => Some(json),
+                    Err(e) => {
+                        eprintln!("Failed to parse JSON: {}", e); // Log or handle the error
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to read line: {}", e); // Log or handle the error
+                    None
+                }
+            }
+        })
+        .filter(|json_value: &Value| {
+            let event_type = json_value.get("type").unwrap();
+            if cli_args.responses_only && event_type != "response" {
+                return false;
+            }
+
+            let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+
+            if cli_args.output_raw {
+                to_writer(&mut stdout, &json_value).unwrap();
+                return false;
+            }
+
+            let raw_auth = json_value.get("auth");
+            let raw_request = json_value.get("request");
+            let raw_response = json_value.get("response");
+
+            to_writer(&mut stdout, &json_value).unwrap();
+
+            return true;
+        })
+        .collect::<Vec<Value>>();
 
     return Ok(lines);
 }
 
+fn process(cli_args: Cli) -> std::io::Result<()> {
+    let logical_cores = num_cpus::get();
+    let metadata = std::fs::metadata(&cli_args.log_file)?;
+    let file_size = metadata.len();
+    let num_threads = if cli_args.single_thread {
+        1
+    } else {
+        std::cmp::min(
+            (file_size / MIN_BYTES_PER_THREAD).max(1) as usize,
+            logical_cores,
+        )
+    };
+    debug_msg!(format!("Number of threads is {num_threads}"));
+    let ranges = split_into_ranges(file_size, num_threads);
+    let mut handles: Vec<JoinHandle<usize>> = vec![];
+    ranges.into_iter().for_each(|range| {
+        let cli_args = cli_args.clone();
+        let handle = std::thread::spawn(move || {
+            let thread_id = std::thread::current().id();
+            debug_msg!(format!(
+                "Thread={:?}; Processing range {:?}",
+                thread_id, range
+            ));
+            let result = filter_lines(&cli_args, range.clone());
+            let result = match result {
+                Ok(lines) => lines.len(),
+                Err(err) => {
+                    err_msg(format!(
+                        "can't process byte range {} thru {} of {}: {err}",
+                        range.start, range.end, cli_args.log_file
+                    ));
+                    0
+                }
+            };
+            result
+        });
+        handles.push(handle);
+    });
+
+    let thread_count = handles.len();
+    let sum: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+
+    ok_msg(format!("Count of threads: {}", thread_count));
+    ok_msg(format!("Count of lines: {}", sum));
+
+    Ok(())
+}
+
+fn parse_args() -> Cli {
+    let matches = Command::new("Read vault audit log")
+        .version("1.0")
+        .arg(
+            Arg::new("single-thread")
+                .short('S')
+                .long("single-thread")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to a single thread"),
+        )
+        .arg(
+            Arg::new("responses-only")
+                .short('R')
+                .long("responses-only")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to responses only"),
+        )
+        .arg(
+            Arg::new("track")
+                .short('t')
+                .long("track")
+                .help("HMAC values to track in the log")
+                .num_args(1..)
+                .value_name("HMAC"),
+        )
+        .arg(
+            Arg::new("start-time")
+                .short('s')
+                .long("start-time")
+                .help("Specify beginning time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("end-time")
+                .short('e')
+                .long("end-time")
+                .help("Specify end time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("raw")
+                .short('r')
+                .long("raw")
+                .action(clap::ArgAction::SetTrue)
+                .help("Print unabridged entries"),
+        )
+        .arg(
+            Arg::new("log_file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
+        )
+        .get_matches();
+
+    Cli {
+        log_file: matches.get_one::<String>("log_file").unwrap().clone(),
+        single_thread: matches.get_flag("single-thread"),
+        output_raw: matches.get_flag("raw"),
+        responses_only: matches.get_flag("responses-only"),
+        start_time: matches.get_one::<String>("start-time").cloned(),
+        end_time: matches.get_one::<String>("end-time").cloned(),
+        track: matches
+            .get_many::<String>("track")
+            .map(|values| values.cloned().collect()),
+    }
+}
+
 fn main() {
     init_logger();
-
-    let args: Vec<String> = env::args().collect();
-    // Check if there are enough arguments
-    if args.len() < 4 {
-        debug_msg!("usage: <FILE> <START_POS> <NUM_BYTES>");
-    } else {
-        let fname = &args[1];
-        let pos: u64 = args[2].parse().unwrap();
-        let num_bytes: u64 = args[3].parse().unwrap();
-
-        let result = read_some_lines(fname, pos, num_bytes);
-        match result {
-            Ok(lines) => println!("{:?}", lines),
-            Err(err) => err_msg(format!("Couldn't find the beginning of the line: {err}")),
-        }
-    }
+    let args: Cli = parse_args();
+    let _ = process(args.clone());
+    debug_msg!(format!("The arguments are: {:?}", args));
 }
 
 #[cfg(test)]
@@ -159,13 +348,14 @@ mod tests {
         Ok(())
     }
 
-    fn assert_read_some_lines(file_path: &str, start_pos: u64, byte_limit: u64, expected: &[&str]) {
-        let result = read_some_lines(file_path, start_pos, byte_limit);
+    fn assert_filter_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
+        let result = filter_lines(file_path, range);
         match result {
             Ok(lines) => assert_eq!(lines, expected),
             Err(e) => panic!("Test failed with error: {:?}", e),
         }
     }
+
     #[test]
     fn test_read_some_lines() -> std::io::Result<()> {
         // Create a temporary file with known content
@@ -177,26 +367,37 @@ mod tests {
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
         // us the whole of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0, 1 as u64, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..1, &["First line"]);
 
-        // Test case 2: start at byte 0 and request 11 bytes (up to and
+        // Test case 3: start at byte 0 and request 11 bytes (up to and
         // including the \n of the first line). Should still give us the whole
         // of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0, 11, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..11, &["First line"]);
 
         // Test case 3: start at byte 0 and request 12 bytes (first byte of
         // line 2). Should still give us lin1 and line 2.
-        assert_read_some_lines(
+        assert_filter_lines(
             file.path().to_str().unwrap(),
-            0,
-            12,
+            0..12,
             &["First line", "Second line"],
         );
 
         // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
         // (well past the end of line 3). Should still give us all of line 3.
-        assert_read_some_lines(file.path().to_str().unwrap(), 30, 100, &["Third line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 30..130, &["Third line"]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_split_into_ranges() {
+        // Create a temporary file with known content
+        init_logger();
+
+        assert_eq!(split_into_ranges(0, 0), vec![]);
+        assert_eq!(split_into_ranges(1, 0), vec![]);
+        assert_eq!(split_into_ranges(0, 1), vec![]);
+        assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
+        assert_eq!(split_into_ranges(1, 3), vec![0..1]);
     }
 }
