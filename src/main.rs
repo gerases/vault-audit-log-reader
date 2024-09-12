@@ -1,3 +1,4 @@
+use clap::{Arg, Command};
 use colored::Colorize;
 use log::{debug, error};
 use num_cpus;
@@ -13,6 +14,15 @@ static INIT: Once = Once::new();
 
 const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
+
+#[derive(Debug)]
+struct Cli {
+    output_raw: Option<bool>,
+    responses_only: Option<bool>,
+    start_time: Option<String>,
+    end_time: Option<String>,
+    track: Option<Vec<String>>,
+}
 
 pub fn init_logger() {
     INIT.call_once(|| {
@@ -122,10 +132,31 @@ fn filter_lines(file_path: &str, range: std::ops::Range<u64>) -> std::io::Result
                 false
             }
         })
-        .map(|line| {
-            Ok(serde_json::from_str(&line.unwrap())?)
+        .filter_map(|line| {
+            match line {
+                Ok(line) => match serde_json::from_str(&line) {
+                    Ok(json) => Some(json),
+                    Err(e) => {
+                        eprintln!("Failed to parse JSON: {}", e); // Log or handle the error
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to read line: {}", e); // Log or handle the error
+                    None
+                }
+            }
         })
-        .collect::<Result<Vec<Value>, serde_json::Error>>()?; // Collect results into a vector and handle errors
+        .filter(|json_value: &Value| {
+            if let Some(event_type) = json_value.get("type") {
+                if event_type == "request" {
+                    println!("{:?}", json_value.get("time"));
+                    return true;
+                }
+            }
+            false
+        })
+        .collect::<Vec<Value>>();
 
     return Ok(lines);
 }
@@ -144,7 +175,7 @@ fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
     };
     debug_msg!(format!("Number of threads is {num_threads}"));
     let ranges = split_into_ranges(file_size, num_threads);
-    let mut handles: Vec<JoinHandle<()>> = vec![];
+    let mut handles: Vec<JoinHandle<usize>> = vec![];
     ranges.into_iter().for_each(|range| {
         let file_path = file_path.to_string();
         let handle = std::thread::spawn(move || {
@@ -154,27 +185,87 @@ fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
                 thread_id, range
             ));
             let result = filter_lines(&file_path, range.clone());
-            let _ = match result {
-                Ok(lines) => println!("Read {} lines", lines.len()),
-                Err(err) => err_msg(format!(
-                    "can't process byte range {} thru {} of {file_path}: {err}",
-                    range.start, range.end
-                )),
+            let result = match result {
+                Ok(lines) => lines.len(),
+                Err(err) => {
+                    err_msg(format!(
+                        "can't process byte range {} thru {} of {file_path}: {err}",
+                        range.start, range.end
+                    ));
+                    0
+                }
             };
+            result
         });
         handles.push(handle);
     });
 
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    let sum: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .sum();
+
+    println!("Count of lines: {}", sum);
 
     Ok(())
 }
 
+fn parse_args() -> Cli {
+    let matches = Command::new("Read vault audit log")
+        .version("1.0")
+        .arg(
+            Arg::new("responses-only")
+                .short('R')
+                .long("responses-only")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to responses only"),
+        )
+        .arg(
+            Arg::new("track")
+                .short('t')
+                .long("track")
+                .help("HMAC values to track in the log")
+                .num_args(1..)
+                .value_name("HMAC"),
+        )
+        .arg(
+            Arg::new("start-time")
+                .short('s')
+                .long("start-time")
+                .help("Specify beginning time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("end-time")
+                .short('e')
+                .long("end-time")
+                .help("Specify end time (e.g. 2024-08-16T18:10:16Z)"),
+        )
+        .arg(
+            Arg::new("raw")
+                .short('r')
+                .long("raw")
+                .action(clap::ArgAction::SetTrue)
+                .help("Print unabridged entries"),
+        )
+        .arg(
+            Arg::new("file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
+        )
+        .get_matches();
+
+    Cli {
+        output_raw: matches.get_one::<bool>("raw").copied(),
+        responses_only: matches.get_one::<bool>("responses-only").copied(),
+        start_time: matches.get_one::<String>("start-time").cloned(),
+        end_time: matches.get_one::<String>("end-time").cloned(),
+        track: matches
+            .get_many::<String>("track")
+            .map(|values| values.cloned().collect()),
+    }
+}
+
 fn main() {
     init_logger();
-
+    let args: Cli = parse_args();
     let args: Vec<String> = env::args().collect();
     // Check if there are enough arguments
     if args.len() < 3 {
