@@ -1,14 +1,18 @@
 use colored::Colorize;
 use log::{debug, error};
+use num_cpus;
+use serde_json::Value;
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::Once;
+use std::thread::JoinHandle;
 
 static INIT: Once = Once::new();
 
 const CHUNK_SIZE: usize = 8;
+const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 pub fn init_logger() {
     INIT.call_once(|| {
@@ -24,25 +28,29 @@ macro_rules! debug_msg {
 }
 
 fn err_msg(msg: String) {
-    error!("{}", msg.red());
+    error!("ERROR: {}", msg.red());
 }
 
-fn split_into_ranges(n: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
-    let chunk_size: u64 = n / num_ranges as u64;
-    let remainder: u64 = n % num_ranges as u64;
-
-    if n == 0 || num_ranges == 0 {
+fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
+    if num_bytes == 0 || num_ranges == 0 {
         return Vec::new(); // No ranges requested
     }
 
-    (0..num_ranges)
+    let chunk_size: u64 = num_bytes / num_ranges as u64;
+    let remainder: u64 = num_bytes % num_ranges as u64;
+
+    (0..if num_bytes > num_ranges as u64 {
+        num_ranges
+    } else {
+        1
+    })
         .scan(0, |start, i| {
             // Calculate the end of the current range
             let end = *start + chunk_size + if i < remainder as usize { 1 } else { 0 };
             // Create the range and update the start for the next iteration
             let range = *start..end;
-            *start = end;  // Update the state (the starting point for the next range)
-            // Return the current range wrapped in Some, so it will be yielded
+            *start = end; // Update the state (the starting point for the next range)
+                          // Return the current range wrapped in Some, so it will be yielded
             Some(range)
         })
         .collect()
@@ -80,10 +88,7 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
     return Ok(seek_pos);
 }
 
-fn read_some_lines(
-    file_path: &str,
-    range: std::ops::Range<u64>,
-) -> std::io::Result<Vec<String>> {
+fn filter_lines(file_path: &str, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
     let mut file = File::open(file_path)?;
 
     let line_start = match find_beginning_of_line(&mut file, range.start) {
@@ -101,7 +106,7 @@ fn read_some_lines(
     let byte_limit: u64 = range.count().try_into().unwrap();
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
-    let lines: Vec<String> = reader
+    let lines: Vec<Value> = reader
         .lines()
         .take_while(|line| {
             if let Ok(ref line) = line {
@@ -109,17 +114,62 @@ fn read_some_lines(
                     return false;
                 }
                 num_bytes_read += line.len() as u64 + 1;
-                debug_msg!(format!(
-                    "Read '{line}', bytes_read={num_bytes_read}, byte_limit={byte_limit}"
-                ));
+                // debug_msg!(format!(
+                //     "Read '{line}', bytes_read={num_bytes_read}, byte_limit={byte_limit}"
+                // ));
                 true
             } else {
                 false
             }
         })
-        .collect::<Result<_, _>>()?; // Collect results into a vector and handle errors
+        .map(|line| {
+            Ok(serde_json::from_str(&line.unwrap())?)
+        })
+        .collect::<Result<Vec<Value>, serde_json::Error>>()?; // Collect results into a vector and handle errors
 
     return Ok(lines);
+}
+
+fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
+    let logical_cores = num_cpus::get();
+    let metadata = std::fs::metadata(file_path)?;
+    let file_size = metadata.len();
+    let num_threads = if use_threads == "no" {
+        1
+    } else {
+        std::cmp::min(
+            (file_size / MIN_BYTES_PER_THREAD).max(1) as usize,
+            logical_cores,
+        )
+    };
+    debug_msg!(format!("Number of threads is {num_threads}"));
+    let ranges = split_into_ranges(file_size, num_threads);
+    let mut handles: Vec<JoinHandle<()>> = vec![];
+    ranges.into_iter().for_each(|range| {
+        let file_path = file_path.to_string();
+        let handle = std::thread::spawn(move || {
+            let thread_id = std::thread::current().id();
+            debug_msg!(format!(
+                "Thread={:?}; Processing range {:?}",
+                thread_id, range
+            ));
+            let result = filter_lines(&file_path, range.clone());
+            let _ = match result {
+                Ok(lines) => println!("Read {} lines", lines.len()),
+                Err(err) => err_msg(format!(
+                    "can't process byte range {} thru {} of {file_path}: {err}",
+                    range.start, range.end
+                )),
+            };
+        });
+        handles.push(handle);
+    });
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    Ok(())
 }
 
 fn main() {
@@ -127,18 +177,12 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
     // Check if there are enough arguments
-    if args.len() < 4 {
-        debug_msg!("usage: <FILE> <START_POS> <NUM_BYTES>");
+    if args.len() < 3 {
+        err_msg("usage: <FILE> <USE-THREADS>".into());
     } else {
         let fname = &args[1];
-        let start_pos: u64 = args[2].parse().unwrap();
-        let num_bytes: u64 = args[3].parse().unwrap();
-
-        let result = read_some_lines(fname, start_pos..(start_pos + num_bytes));
-        match result {
-            Ok(lines) => println!("{:?}", lines),
-            Err(err) => err_msg(format!("Couldn't find the beginning of the line: {err}")),
-        }
+        let use_threads = &args[2];
+        let _ = process(fname, use_threads);
     }
 }
 
@@ -180,13 +224,14 @@ mod tests {
         Ok(())
     }
 
-    fn assert_read_some_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
-        let result = read_some_lines(file_path, range);
+    fn assert_filter_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
+        let result = filter_lines(file_path, range);
         match result {
             Ok(lines) => assert_eq!(lines, expected),
             Err(e) => panic!("Test failed with error: {:?}", e),
         }
     }
+
     #[test]
     fn test_read_some_lines() -> std::io::Result<()> {
         // Create a temporary file with known content
@@ -198,16 +243,16 @@ mod tests {
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
         // us the whole of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0..1, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..1, &["First line"]);
 
-        // Test case 2: start at byte 0 and request 11 bytes (up to and
+        // Test case 3: start at byte 0 and request 11 bytes (up to and
         // including the \n of the first line). Should still give us the whole
         // of the first line.
-        assert_read_some_lines(file.path().to_str().unwrap(), 0..11, &["First line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 0..11, &["First line"]);
 
         // Test case 3: start at byte 0 and request 12 bytes (first byte of
         // line 2). Should still give us lin1 and line 2.
-        assert_read_some_lines(
+        assert_filter_lines(
             file.path().to_str().unwrap(),
             0..12,
             &["First line", "Second line"],
@@ -215,8 +260,20 @@ mod tests {
 
         // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
         // (well past the end of line 3). Should still give us all of line 3.
-        assert_read_some_lines(file.path().to_str().unwrap(), 30..130, &["Third line"]);
+        assert_filter_lines(file.path().to_str().unwrap(), 30..130, &["Third line"]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_split_into_ranges() {
+        // Create a temporary file with known content
+        init_logger();
+
+        assert_eq!(split_into_ranges(0, 0), vec![]);
+        assert_eq!(split_into_ranges(1, 0), vec![]);
+        assert_eq!(split_into_ranges(0, 1), vec![]);
+        assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
+        assert_eq!(split_into_ranges(1, 3), vec![0..1]);
     }
 }
