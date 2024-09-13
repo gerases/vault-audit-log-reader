@@ -1,27 +1,50 @@
 use clap::{Arg, Command};
 use colored::Colorize;
-use log::{debug, error};
+use log::{debug, error, info};
 use num_cpus;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::Once;
 use std::thread::JoinHandle;
+use termcolor::{ColorChoice, StandardStream};
+use termcolor_json::to_writer;
 
 static INIT: Once = Once::new();
 
 const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
+struct Request<'a> {
+    id: &'a str,
+    // actor:          &'a str,
+    path: &'a str,
+    operation: &'a str,
+    clnt_tok:       &'a str,
+    accsr_tok:      &'a str,
+    tok_issue:      &'a str,
+    remote_address: &'a str,
+}
+
+#[derive(Debug, Clone)]
 struct Cli {
-    output_raw: Option<bool>,
-    responses_only: Option<bool>,
+    output_raw: bool,
+    responses_only: bool,
     start_time: Option<String>,
     end_time: Option<String>,
     track: Option<Vec<String>>,
+    single_thread: bool,
+    log_file: String,
+}
+
+macro_rules! debug_msg {
+    ($msg:expr) => {{
+        let location = std::panic::Location::caller();
+        debug!("{}:{}: {}", location.file(), location.line(), $msg);
+    }};
 }
 
 pub fn init_logger() {
@@ -30,11 +53,8 @@ pub fn init_logger() {
     });
 }
 
-macro_rules! debug_msg {
-    ($msg:expr) => {{
-        let location = std::panic::Location::caller();
-        debug!("{}:{}: {}", location.file(), location.line(), $msg);
-    }};
+fn ok_msg(msg: String) {
+    info!("{}", msg.green());
 }
 
 fn err_msg(msg: String) {
@@ -98,8 +118,8 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
     return Ok(seek_pos);
 }
 
-fn filter_lines(file_path: &str, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
-    let mut file = File::open(file_path)?;
+fn filter_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
+    let mut file = File::open(&cli_args.log_file)?;
 
     let line_start = match find_beginning_of_line(&mut file, range.start) {
         Ok(line_start) => {
@@ -124,9 +144,6 @@ fn filter_lines(file_path: &str, range: std::ops::Range<u64>) -> std::io::Result
                     return false;
                 }
                 num_bytes_read += line.len() as u64 + 1;
-                // debug_msg!(format!(
-                //     "Read '{line}', bytes_read={num_bytes_read}, byte_limit={byte_limit}"
-                // ));
                 true
             } else {
                 false
@@ -148,24 +165,36 @@ fn filter_lines(file_path: &str, range: std::ops::Range<u64>) -> std::io::Result
             }
         })
         .filter(|json_value: &Value| {
-            if let Some(event_type) = json_value.get("type") {
-                if event_type == "request" {
-                    println!("{:?}", json_value.get("time"));
-                    return true;
-                }
+            let event_type = json_value.get("type").unwrap();
+            if cli_args.responses_only && event_type != "response" {
+                return false;
             }
-            false
+
+            let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+
+            if cli_args.output_raw {
+                to_writer(&mut stdout, &json_value).unwrap();
+                return false;
+            }
+
+            let raw_auth = json_value.get("auth");
+            let raw_request = json_value.get("request");
+            let raw_response = json_value.get("response");
+
+            to_writer(&mut stdout, &json_value).unwrap();
+
+            return true;
         })
         .collect::<Vec<Value>>();
 
     return Ok(lines);
 }
 
-fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
+fn process(cli_args: Cli) -> std::io::Result<()> {
     let logical_cores = num_cpus::get();
-    let metadata = std::fs::metadata(file_path)?;
+    let metadata = std::fs::metadata(&cli_args.log_file)?;
     let file_size = metadata.len();
-    let num_threads = if use_threads == "no" {
+    let num_threads = if cli_args.single_thread {
         1
     } else {
         std::cmp::min(
@@ -177,20 +206,20 @@ fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
     let ranges = split_into_ranges(file_size, num_threads);
     let mut handles: Vec<JoinHandle<usize>> = vec![];
     ranges.into_iter().for_each(|range| {
-        let file_path = file_path.to_string();
+        let cli_args = cli_args.clone();
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
                 "Thread={:?}; Processing range {:?}",
                 thread_id, range
             ));
-            let result = filter_lines(&file_path, range.clone());
+            let result = filter_lines(&cli_args, range.clone());
             let result = match result {
                 Ok(lines) => lines.len(),
                 Err(err) => {
                     err_msg(format!(
-                        "can't process byte range {} thru {} of {file_path}: {err}",
-                        range.start, range.end
+                        "can't process byte range {} thru {} of {}: {err}",
+                        range.start, range.end, cli_args.log_file
                     ));
                     0
                 }
@@ -200,12 +229,14 @@ fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
         handles.push(handle);
     });
 
+    let thread_count = handles.len();
     let sum: usize = handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .sum();
 
-    println!("Count of lines: {}", sum);
+    ok_msg(format!("Count of threads: {}", thread_count));
+    ok_msg(format!("Count of lines: {}", sum));
 
     Ok(())
 }
@@ -213,6 +244,13 @@ fn process(file_path: &str, use_threads: &String) -> std::io::Result<()> {
 fn parse_args() -> Cli {
     let matches = Command::new("Read vault audit log")
         .version("1.0")
+        .arg(
+            Arg::new("single-thread")
+                .short('S')
+                .long("single-thread")
+                .action(clap::ArgAction::SetTrue)
+                .help("Limit to a single thread"),
+        )
         .arg(
             Arg::new("responses-only")
                 .short('R')
@@ -248,13 +286,15 @@ fn parse_args() -> Cli {
                 .help("Print unabridged entries"),
         )
         .arg(
-            Arg::new("file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
+            Arg::new("log_file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
         )
         .get_matches();
 
     Cli {
-        output_raw: matches.get_one::<bool>("raw").copied(),
-        responses_only: matches.get_one::<bool>("responses-only").copied(),
+        log_file: matches.get_one::<String>("log_file").unwrap().clone(),
+        single_thread: matches.get_flag("single-thread"),
+        output_raw: matches.get_flag("raw"),
+        responses_only: matches.get_flag("responses-only"),
         start_time: matches.get_one::<String>("start-time").cloned(),
         end_time: matches.get_one::<String>("end-time").cloned(),
         track: matches
@@ -266,15 +306,8 @@ fn parse_args() -> Cli {
 fn main() {
     init_logger();
     let args: Cli = parse_args();
-    let args: Vec<String> = env::args().collect();
-    // Check if there are enough arguments
-    if args.len() < 3 {
-        err_msg("usage: <FILE> <USE-THREADS>".into());
-    } else {
-        let fname = &args[1];
-        let use_threads = &args[2];
-        let _ = process(fname, use_threads);
-    }
+    let _ = process(args.clone());
+    debug_msg!(format!("The arguments are: {:?}", args));
 }
 
 #[cfg(test)]
