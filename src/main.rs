@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+use std::collections::HashSet;
 use colored::Colorize;
 use dns_lookup::lookup_addr;
 use log::{debug, error, info};
@@ -10,9 +11,12 @@ use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::Once;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
+
+type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
 
 static INIT: Once = Once::new();
 
@@ -232,7 +236,7 @@ fn read_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Ve
     Ok(lines)
 }
 
-fn filter_lines(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
+fn filter(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
@@ -252,40 +256,6 @@ fn filter_lines(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value
             if cli_args.responses_only && event_type != "response" {
                 return false;
             }
-
-            let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-
-            if cli_args.output_raw {
-                to_writer(&mut stdout, &json_value).unwrap();
-                return false;
-            }
-
-            let raw_auth = json_value.get("auth").unwrap();
-            let raw_request = json_value.get("request").unwrap();
-            // let raw_response = json_value.get("response").unwrap();
-
-            let request = Request {
-                id: raw_request.get("id").unwrap().as_str().unwrap(),
-                time: json_value.get("time").unwrap().as_str().unwrap(),
-                tok_issue: raw_auth.get("token_issue_time").unwrap().as_str().unwrap(),
-                actor: &actor(raw_auth),
-                tok_type: raw_auth.get("token_type").unwrap().as_str().unwrap(),
-                clnt_tok: raw_auth.get("client_token").unwrap().as_str().unwrap(),
-                accsr_tok: raw_auth.get("accessor").unwrap().as_str().unwrap(),
-                path: raw_request.get("path").unwrap().as_str().unwrap(),
-                operation: raw_request.get("operation").unwrap().as_str().unwrap(),
-                remote_address: &format_ipv4_addr(raw_request.get("remote_address")),
-            };
-
-            let log_entry = LogEntry {
-                request: request,
-                event_type: json_value.get("type").unwrap().as_str().unwrap(),
-            };
-
-            to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
-                err_msg(format!("Couldn't write a json line to the screen: {error}").into());
-            });
-
             return true;
         })
         .collect::<Vec<Value>>();
@@ -307,42 +277,71 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     };
     debug_msg!(format!("Number of threads is {num_threads}"));
     let ranges = split_into_ranges(file_size, num_threads);
-    let mut handles: Vec<JoinHandle<usize>> = vec![];
+    let mut handles: Vec<JoinHandle<()>> = vec![];
+    let queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
     ranges.into_iter().for_each(|range| {
         let cli_args = cli_args.clone();
+        let queue_clone = Arc::clone(&queue);
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
                 "Thread={:?}; Processing range {:?}",
                 thread_id, range
             ));
+            let mut queue = queue_clone.lock().unwrap();
             let lines = read_lines(&cli_args, range.clone()).unwrap();
-            let result = filter_lines(&cli_args, lines);
-            let result = match result {
-                Ok(lines) => lines.len(),
-                Err(err) => {
-                    err_msg(format!(
-                        "can't process byte range {} thru {} of {}: {err}",
-                        range.start, range.end, cli_args.log_file
-                    ));
-                    0
-                }
-            };
-            result
+            let filtered = filter(&cli_args, lines);
+            queue.extend(filtered.unwrap());
         });
         handles.push(handle);
     });
 
     let thread_count = handles.len();
-    let sum: usize = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("Error in thread"))
-        .sum();
+    for handle in handles {
+        handle.join().unwrap_or_else(|error| {
+            err_msg(format!("Error waiting for thread to join: {:?}", error));
+        });
+        ok_msg(format!("Count of threads: {}", thread_count));
+        ok_msg(format!("Count of lines: {}", queue.lock().unwrap().len()));
+    }
 
-    ok_msg(format!("Count of threads: {}", thread_count));
-    ok_msg(format!("Count of lines: {}", sum));
+    output(&cli_args, &queue);
 
     Ok(())
+}
+
+fn output(cli_args: &Cli, queue: &SharedQueue<Value>) {
+    for json_value in queue.lock().unwrap().iter() {
+        let raw_auth = json_value.get("auth").unwrap();
+        let raw_request = json_value.get("request").unwrap();
+        // let raw_response = json_value.get("response").unwrap();
+
+        let request = Request {
+            id: raw_request.get("id").unwrap().as_str().unwrap(),
+            time: json_value.get("time").unwrap().as_str().unwrap(),
+            tok_issue: raw_auth.get("token_issue_time").unwrap().as_str().unwrap(),
+            actor: &actor(raw_auth),
+            tok_type: raw_auth.get("token_type").unwrap().as_str().unwrap(),
+            clnt_tok: raw_auth.get("client_token").unwrap().as_str().unwrap(),
+            accsr_tok: raw_auth.get("accessor").unwrap().as_str().unwrap(),
+            path: raw_request.get("path").unwrap().as_str().unwrap(),
+            operation: raw_request.get("operation").unwrap().as_str().unwrap(),
+            remote_address: &format_ipv4_addr(raw_request.get("remote_address")),
+        };
+
+        let log_entry = LogEntry {
+            request: request,
+            event_type: json_value.get("type").unwrap().as_str().unwrap(),
+        };
+
+        let mut stdout = StandardStream::stdout(ColorChoice::Auto);
+        if cli_args.output_raw {
+            to_writer(&mut stdout, &json_value).unwrap();
+        }
+        to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
+            err_msg(format!("Couldn't write a json line to the screen: {error}").into());
+        });
+    }
 }
 
 fn parse_args() -> Cli {
