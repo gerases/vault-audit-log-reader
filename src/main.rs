@@ -81,6 +81,70 @@ fn err_msg(msg: String) {
     error!("ERROR: {}", msg.red());
 }
 
+fn actor(auth: &Value) -> String {
+    match auth.get("metadata") {
+        Some(value) => match value.get("role_name") {
+            Some(role_name) => role_name.as_str().unwrap().to_string(),
+            None => value.get("username").unwrap().as_str().unwrap().to_string(),
+        },
+        None => auth
+            .get("display_name")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string(),
+    }
+}
+
+fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
+    let hostname = lookup_addr(&ip)?;
+    Ok(hostname)
+}
+
+fn format_ipv4_addr(remote_addr: Option<&Value>) -> String {
+    match remote_addr {
+        Some(value) => match value.as_str() {
+            Some(addr_str) => {
+                let addr: IpAddr = addr_str.parse().unwrap_or_else(|error| {
+                    err_msg(format!("Couldn't parse '{addr_str}': {error}").into());
+                    "0.0.0.0".parse().unwrap()
+                });
+                match resolve_ip_to_hostname(addr) {
+                    Ok(hostname) => hostname,
+                    Err(_) => format!("Can't resolve '{}'", addr_str.to_string()),
+                }
+            }
+            None => String::from("Can't convert to string"),
+        },
+        None => String::from("Remote addr missing"),
+    }
+}
+
+fn format_hmacs(json_obj: &mut Value) {
+    match json_obj {
+        Value::Object(map) => {
+            for (_, val) in map.iter_mut() {
+                format_hmacs(val);
+            }
+        }
+        Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                format_hmacs(val);
+            }
+        }
+        Value::String(s) => {
+            if s.starts_with(HMAC_PFX_LONG) {
+                let replaced = s.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
+                // the string 'hmac:' is 5 letters
+                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX_SHORT.len()).collect();
+            }
+        }
+        _ => {
+            // do nothing for everything else
+        }
+    }
+}
+
 fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
     if num_bytes == 0 || num_ranges == 0 {
         return Vec::new(); // No ranges requested
@@ -667,5 +731,124 @@ mod tests {
         assert_eq!(split_into_ranges(0, 1), vec![]);
         assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
         assert_eq!(split_into_ranges(1, 3), vec![0..1]);
+    }
+
+    mod test_format_hmacs {
+        use super::*;
+
+        #[test]
+        fn test_format_hmacs_on_string() {
+            let mut json_value = json!("hmac-sha256:1234567890abcdef");
+            format_hmacs(&mut json_value);
+            assert_eq!(json_value, json!("hmac:1234567890"));
+        }
+
+        #[test]
+        fn test_format_hmacs_on_nested_object() {
+            let mut json_value = json!({
+                "key": "hmac-sha256:1234567890abcdef",
+                "nested": {
+                    "hmac": "hmac-sha256:abcdef1234567890"
+                }
+            });
+            format_hmacs(&mut json_value);
+            assert_eq!(
+                json_value,
+                json!({
+                    "key": "hmac:1234567890",
+                    "nested": {
+                        "hmac": "hmac:abcdef1234"
+                    }
+                })
+            );
+        }
+
+        #[test]
+        fn test_format_hmacs_on_array() {
+            let mut json_value = json!([
+                "hmac-sha256:abcdef1234567890",
+                "hmac-sha256:9876543210abcdef"
+            ]);
+            format_hmacs(&mut json_value);
+            assert_eq!(json_value, json!(["hmac:abcdef1234", "hmac:9876543210"]));
+        }
+
+        #[test]
+        fn test_format_hmacs_no_change_for_non_hmac_string() {
+            let mut json_value = json!("some other string");
+            format_hmacs(&mut json_value);
+            assert_eq!(json_value, json!("some other string"));
+        }
+
+        #[test]
+        fn test_format_hmacs_no_change_for_non_string_value() {
+            let mut json_value = json!(123);
+            format_hmacs(&mut json_value);
+            assert_eq!(json_value, json!(123));
+        }
+    }
+
+    mod test_track_hmacs {
+        use super::*;
+
+        #[test]
+        fn when_extra_tokens_present() {
+            let hmac_str = format!("{HMAC_PFX_LONG}:123456789");
+            let tracked_tok = format!("{hmac_str}a");
+            let json_value = json!({
+                "token": tracked_tok,
+                "accessor": format!("{hmac_str}b"),
+                "plaintext": format!("{hmac_str}c"),
+                "client_token_accessor": format!("{hmac_str}d"),
+                "key1": {
+                     "ciphertext": format!("{hmac_str}e"),
+                     "client_token": format!("{hmac_str}f")
+                }
+            });
+            let mut tracked_hmacs: HashSet<String> = HashSet::new();
+            tracked_hmacs.insert(tracked_tok.to_string());
+
+            // all of the HMACs should be found
+            let mut expected: HashSet<String> = HashSet::new();
+            ('a'..='f').for_each(|chr| {
+                let hmac_str = format!("{hmac_str}{chr}");
+                expected.insert(hmac_str.to_string());
+            });
+
+            track_hmacs(&json_value, &mut tracked_hmacs);
+            assert_eq!(tracked_hmacs, expected);
+        }
+
+        #[test]
+        fn when_nothing_extra_found() {
+            // This token is not related to any of the tokens in the request.
+            // So the tracked tokens set should not expand.
+            let tracked_tok = format!("hmac:abcdef");
+            let hmac_str = "hmac:123456789";
+            let json_value = json!({
+                "token": format!("{hmac_str}a"),
+                "accessor": format!("{hmac_str}b"),
+                "plaintext": format!("{hmac_str}c"),
+                "client_token_accessor": format!("{hmac_str}d"),
+                "key1": {
+                     "ciphertext": format!("{hmac_str}e"),
+                     "client_token": format!("{hmac_str}f")
+                }
+            });
+
+            let mut tracked_hmacs: HashSet<String> = HashSet::new();
+            tracked_hmacs.insert(tracked_tok.to_string());
+            track_hmacs(&json_value, &mut tracked_hmacs);
+
+            // all of the HMACs should be found
+            let mut expected: HashSet<String> = HashSet::new();
+            ('a'..='f').for_each(|chr| {
+                let hmac_str = format!("{hmac_str}{chr}");
+                expected.insert(hmac_str.to_string());
+            });
+
+            track_hmacs(&json_value, &mut tracked_hmacs);
+            assert_eq!(tracked_hmacs, [tracked_tok].into());
+        }
     }
 }
