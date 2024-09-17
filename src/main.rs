@@ -24,8 +24,7 @@ static INIT: Once = Once::new();
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
-const HMAC_PFX_SHORT: &str = "hmac:";
-const HMAC_PFX_LONG: &str = "hmac-sha256:";
+const HMAC_PFX: &str = "hmac:";
 const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
@@ -142,10 +141,10 @@ fn format_hmacs(json_obj: &mut Value) {
             }
         }
         Value::String(s) => {
-            if s.starts_with(HMAC_PFX_LONG) {
-                let replaced = s.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
+            if s.starts_with("hmac-sha256:") {
+                let replaced = s.replace("hmac-sha256:", HMAC_PFX);
                 // the string 'hmac:' is 5 letters
-                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX_SHORT.len()).collect();
+                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX.len()).collect();
             }
         }
         _ => {
@@ -389,7 +388,13 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
                     match val {
                         Value::Object(_) => find_hmac_values(val, hmac_values, include_keys),
                         Value::String(s) => {
+<<<<<<< HEAD
                             if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX_LONG) {
+=======
+                            // We check for "hmac" in the beginning of the string because by this
+                            // point hmac-256 might have already been replaced to just hmac.
+                            if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX) {
+>>>>>>> d48bc0a (Implement track_hmacs)
                                 hmac_values.insert(s.clone());
                             }
                         }
@@ -671,8 +676,9 @@ mod tests {
                 expected.insert(hmac_str.to_string());
             });
 
-            track_hmacs(&json_value, &mut tracked_hmacs);
+            let result = track_hmacs(&json_value, &mut tracked_hmacs);
             assert_eq!(tracked_hmacs, expected);
+            assert_eq!(result, true);
         }
 
         #[test]
@@ -703,8 +709,9 @@ mod tests {
                 expected.insert(hmac_str.to_string());
             });
 
-            track_hmacs(&json_value, &mut tracked_hmacs);
+            let result = track_hmacs(&json_value, &mut tracked_hmacs);
             assert_eq!(tracked_hmacs, [tracked_tok].into());
+            assert_eq!(result, false);
         }
     }
 }
