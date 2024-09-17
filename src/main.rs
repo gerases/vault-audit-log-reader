@@ -24,7 +24,8 @@ static INIT: Once = Once::new();
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
-const HMAC_PFX: &str = "hmac:";
+const HMAC_PFX_SHORT: &str = "hmac:";
+const HMAC_PFX_LONG: &str = "hmac-sha256:";
 const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
@@ -141,10 +142,10 @@ fn format_hmacs(json_obj: &mut Value) {
             }
         }
         Value::String(s) => {
-            if s.starts_with("hmac-sha256:") {
-                let replaced = s.replace("hmac-sha256:", HMAC_PFX);
+            if s.starts_with(HMAC_PFX_LONG) {
+                let replaced = s.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
                 // the string 'hmac:' is 5 letters
-                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX.len()).collect();
+                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX_SHORT.len()).collect();
             }
         }
         _ => {
@@ -252,8 +253,7 @@ fn filter(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
-            Ok(mut json) => {
-                format_hmacs(&mut json);
+            Ok(json) => {
                 Some(json)
             }
             Err(e) => {
@@ -305,8 +305,11 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
             ));
             let mut queue = queue_clone.lock().unwrap();
             let lines = read_lines(&cli_args, range.clone()).unwrap();
-            let filtered = filter(&cli_args, lines);
-            queue.extend(filtered.unwrap());
+            let mut filtered = filter(&cli_args, lines).unwrap();
+            for value in filtered.iter_mut() {
+                format_hmacs(value);
+            }
+            queue.extend(filtered);
         });
         handles.push(handle);
     });
@@ -386,9 +389,7 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
                     match val {
                         Value::Object(_) => find_hmac_values(val, hmac_values, include_keys),
                         Value::String(s) => {
-                            // We check for "hmac" in the beginning of the string because by this
-                            // point hmac-256 might have already been replaced to just hmac.
-                            if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX) {
+                            if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX_LONG) {
                                 hmac_values.insert(s.clone());
                             }
                         }
