@@ -135,7 +135,10 @@ fn format_hmacs(json_obj: &mut Value) {
             if s.starts_with("hmac-sha256:") {
                 let replaced = s.replace("hmac-sha256:", HMAC_PFX);
                 // the string 'hmac:' is 5 letters
-                *s = replaced.chars().take(HMAC_LEN + HMAC_PFX.len()).collect();
+                *s = replaced
+                    .chars()
+                    .take(HMAC_LEN + HMAC_PFX_SHORT.len())
+                    .collect();
             }
         }
         _ => {
@@ -279,9 +282,7 @@ fn filter(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
-            Ok(json) => {
-                Some(json)
-            }
+            Ok(json) => Some(json),
             Err(e) => {
                 err_msg(format!(
                     "Failed to convert the following line to JSON: '{line}': {e}"
@@ -341,12 +342,12 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     });
 
     let thread_count = handles.len();
+    ok_msg(format!("Threads: {}", thread_count));
     for handle in handles {
         handle.join().unwrap_or_else(|error| {
             err_msg(format!("Error waiting for thread to join: {:?}", error));
         });
-        ok_msg(format!("Count of threads: {}", thread_count));
-        ok_msg(format!("Count of lines: {}", queue.lock().unwrap().len()));
+        debug_msg!(format!("Count of lines: {}", queue.lock().unwrap().len()));
     }
 
     output(&cli_args, &queue);
@@ -415,13 +416,7 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
                     match val {
                         Value::Object(_) => find_hmac_values(val, hmac_values, include_keys),
                         Value::String(s) => {
-<<<<<<< HEAD
                             if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX_LONG) {
-=======
-                            // We check for "hmac" in the beginning of the string because by this
-                            // point hmac-256 might have already been replaced to just hmac.
-                            if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX) {
->>>>>>> d48bc0a (Implement track_hmacs)
                                 hmac_values.insert(s.clone());
                             }
                         }
@@ -445,11 +440,14 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
     ]);
     find_hmac_values(event, &mut hmac_values, &include_keys);
 
-    // If there's a match on at least one token, merge the hashsets.
-    if !tracked_tokens.is_disjoint(&hmac_values) {
+    if hmac_values
+        .iter()
+        .any(|hmac| tracked_tokens.iter().any(|token| hmac.starts_with(token)))
+    {
         tracked_tokens.extend(hmac_values);
         return true;
     }
+
     return false;
 }
 
@@ -499,7 +497,11 @@ fn parse_args() -> Cli {
                 .help("Print unabridged entries"),
         )
         .arg(
-            Arg::new("log_file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
+            Arg::new("log_file")
+                .short('f')
+                .long("file")
+                .required(true)
+                .value_name("LOG_FILE"), // This is how it will be referred to in the help message
         )
         .get_matches();
 
@@ -745,7 +747,7 @@ mod tests {
         fn test_format_hmacs_on_string() {
             let mut json_value = json!("hmac-sha256:1234567890abcdef");
             format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!("hmac:1234567890"));
+            assert_eq!(json_value, json!("hmac-sha256:1234567890"));
         }
 
         #[test]
@@ -760,9 +762,9 @@ mod tests {
             assert_eq!(
                 json_value,
                 json!({
-                    "key": "hmac:1234567890",
+                    "key": "hmac-sha256:1234567890",
                     "nested": {
-                        "hmac": "hmac:abcdef1234"
+                        "hmac": "hmac-sha256:abcdef1234"
                     }
                 })
             );
@@ -775,7 +777,7 @@ mod tests {
                 "hmac-sha256:9876543210abcdef"
             ]);
             format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!(["hmac:abcdef1234", "hmac:9876543210"]));
+            assert_eq!(json_value, json!(["hmac-sha256:abcdef1234", "hmac-sha256:9876543210"]));
         }
 
         #[test]
