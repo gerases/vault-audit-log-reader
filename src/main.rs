@@ -554,7 +554,7 @@ mod tests {
             responses_only: false,
             // start_time: String::from("").into(),
             // end_time: String::from("").into(),
-            // track: vec![].into(),
+            track: Some(HashSet::new()),
         };
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
@@ -649,7 +649,7 @@ mod tests {
 
         #[test]
         fn when_extra_tokens_present() {
-            let hmac_str = "hmac:123456789";
+            let hmac_str = format!("{HMAC_PFX_LONG}:123456789");
             let tracked_tok = format!("{hmac_str}a");
             let json_value = json!({
                 "token": tracked_tok,
