@@ -63,6 +63,7 @@ struct Cli {
     track: Option<HashSet<String>>,
     single_thread: bool,
     log_file: String,
+    summary: bool,
 }
 
 macro_rules! debug_msg {
@@ -350,8 +351,20 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         return;
     }
 
-    for (path, count) in summary.lock().unwrap().iter() {
-        println!("{path} => {count}");
+    if cli_args.summary {
+        let mut sorted_vec: Vec<(String, usize)> = summary
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+
+        sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (path, count) in sorted_vec {
+            println!("{path} => {count}");
+        }
+        return;
     }
 
     for json_value in json_events.iter() {
@@ -461,6 +474,12 @@ fn parse_args() -> Cli {
                 .help("Limit to responses only"),
         )
         .arg(
+            Arg::new("summary")
+                .long("summary")
+                .action(clap::ArgAction::SetTrue)
+                .help("Show only the summary"),
+        )
+        .arg(
             Arg::new("track")
                 .short('t')
                 .long("track")
@@ -502,6 +521,7 @@ fn parse_args() -> Cli {
         single_thread: matches.get_flag("single-thread"),
         output_raw: matches.get_flag("raw"),
         responses_only: matches.get_flag("responses-only"),
+        summary: matches.get_flag("summary"),
         // start_time: matches.get_one::<String>("start-time").cloned(),
         // end_time: matches.get_one::<String>("end-time").cloned(),
         track: matches
@@ -578,6 +598,7 @@ mod tests {
             single_thread: false,
             output_raw: false,
             responses_only: false,
+            summary: false,
             // start_time: String::from("").into(),
             // end_time: String::from("").into(),
             track: Some(HashSet::new()),
