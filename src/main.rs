@@ -31,10 +31,10 @@ const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Request<'a> {
-    id: &'a str,
-    actor: &'a str,
     time: &'a str,
+    id: &'a str,
     path: &'a str,
+    actor: &'a str,
     operation: &'a str,
     clnt_tok: &'a str,
     accsr_tok: &'a str,
@@ -63,6 +63,7 @@ struct Cli {
     track: Option<HashSet<String>>,
     single_thread: bool,
     log_file: String,
+    path: Option<String>,
     summary: bool,
 }
 
@@ -272,13 +273,18 @@ fn filter(
         .filter(|json_value: &Value| {
             let event_type = json_value.get("type").unwrap();
             let mut summary = summary.lock().unwrap();
-            let path = json_value
+            let vault_path = json_value
                 .get("request")
                 .unwrap()
                 .get("path")
                 .unwrap()
                 .to_string();
-            *summary.entry(path).or_insert(0) += 1;
+            *summary.entry(vault_path.clone()).or_insert(0) += 1;
+            if let Some(path) = &cli_args.path {
+                if vault_path.starts_with(path) {
+                    return true;
+                }
+            }
             if cli_args.responses_only && event_type != "response" {
                 return false;
             }
@@ -508,22 +514,29 @@ fn parse_args() -> Cli {
                 .help("Print unabridged entries"),
         )
         .arg(
+            Arg::new("path")
+                .short('p')
+                .long("path")
+                .value_name("VAULT_PATH"),
+        )
+        .arg(
             Arg::new("log_file")
                 .short('f')
                 .long("file")
                 .required(true)
-                .value_name("LOG_FILE"), // This is how it will be referred to in the help message
+                .value_name("LOG_FILE"),
         )
         .get_matches();
 
     Cli {
+        // start_time: matches.get_one::<String>("start-time").cloned(),
+        // end_time: matches.get_one::<String>("end-time").cloned(),
         log_file: matches.get_one::<String>("log_file").unwrap().clone(),
         single_thread: matches.get_flag("single-thread"),
         output_raw: matches.get_flag("raw"),
         responses_only: matches.get_flag("responses-only"),
         summary: matches.get_flag("summary"),
-        // start_time: matches.get_one::<String>("start-time").cloned(),
-        // end_time: matches.get_one::<String>("end-time").cloned(),
+        path: matches.get_one::<String>("path").cloned(),
         track: matches
             .get_many::<String>("track")
             .map(|values| values.cloned().collect()),
@@ -599,9 +612,10 @@ mod tests {
             output_raw: false,
             responses_only: false,
             summary: false,
+            path: None,
             // start_time: String::from("").into(),
             // end_time: String::from("").into(),
-            track: Some(HashSet::new()),
+            track: None,
         };
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
