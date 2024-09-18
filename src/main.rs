@@ -98,12 +98,7 @@ fn actor(auth: &Value) -> String {
             Some(role_name) => role_name.as_str().unwrap().to_string(),
             None => value.get("username").unwrap().as_str().unwrap().to_string(),
         },
-        None => auth
-            .get("display_name")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string(),
+        None => get_str_from_json(auth, "display_name").to_string()
     }
 }
 
@@ -350,6 +345,16 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
+fn get_str_from_json<'a>(json_value: &'a Value, key: &str) -> &'a str {
+    json_value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            eprintln!("Missing or invalid value for key: {}", key);
+            ""
+        })
+}
+
 fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
     let json_events = queue.lock().unwrap();
     if json_events.is_empty() {
@@ -379,15 +384,15 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         // let raw_response = json_value.get("response").unwrap();
 
         let request = Request {
-            id: raw_request.get("id").unwrap().as_str().unwrap(),
-            time: json_value.get("time").unwrap().as_str().unwrap(),
-            tok_issue: raw_auth.get("token_issue_time").unwrap().as_str().unwrap(),
+            id: get_str_from_json(&raw_request, "id"),
+            time: get_str_from_json(&json_value, "time"),
+            tok_issue: get_str_from_json(&raw_auth, "token_issue_time"),
             actor: &actor(raw_auth),
-            tok_type: raw_auth.get("token_type").unwrap().as_str().unwrap(),
-            clnt_tok: raw_auth.get("client_token").unwrap().as_str().unwrap(),
-            accsr_tok: raw_auth.get("accessor").unwrap().as_str().unwrap(),
-            path: raw_request.get("path").unwrap().as_str().unwrap(),
-            operation: raw_request.get("operation").unwrap().as_str().unwrap(),
+            tok_type:  get_str_from_json(&raw_auth, "token_type"),
+            clnt_tok:  get_str_from_json(&raw_auth, "client_token"),
+            accsr_tok: get_str_from_json(&raw_auth, "accessor"),
+            path:      get_str_from_json(&raw_request, "path"),
+            operation: get_str_from_json(&raw_request, "operation"),
             remote_address: &format_ipv4_addr(raw_request.get("remote_address")),
         };
 
