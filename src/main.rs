@@ -6,7 +6,7 @@ use log::{debug, error, info};
 use num_cpus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -18,6 +18,7 @@ use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
 
 type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
+type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
 
 static INIT: Once = Once::new();
 
@@ -249,7 +250,11 @@ fn read_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Ve
     Ok(lines)
 }
 
-fn filter(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
+fn filter(
+    cli_args: &Cli,
+    lines: Vec<String>,
+    summary: SharedMap<String, usize>,
+) -> std::io::Result<Vec<Value>> {
     let mut tracked_hmacs: HashSet<String> = cli_args.track.clone().unwrap_or(HashSet::new());
 
     let result = lines
@@ -265,6 +270,14 @@ fn filter(cli_args: &Cli, lines: Vec<String>) -> std::io::Result<Vec<Value>> {
         })
         .filter(|json_value: &Value| {
             let event_type = json_value.get("type").unwrap();
+            let mut summary = summary.lock().unwrap();
+            let path = json_value
+                .get("request")
+                .unwrap()
+                .get("path")
+                .unwrap()
+                .to_string();
+            *summary.entry(path).or_insert(0) += 1;
             if cli_args.responses_only && event_type != "response" {
                 return false;
             }
@@ -294,9 +307,11 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     let ranges = split_into_ranges(file_size, num_threads);
     let mut handles: Vec<JoinHandle<()>> = vec![];
     let queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
+    let summary: SharedMap<String, usize> = Arc::new(Mutex::new(HashMap::new()));
     ranges.into_iter().for_each(|range| {
         let cli_args = cli_args.clone();
         let queue_clone = Arc::clone(&queue);
+        let summary_clone = Arc::clone(&summary);
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
@@ -305,7 +320,7 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
             ));
             let mut queue = queue_clone.lock().unwrap();
             let lines = read_lines(&cli_args, range.clone()).unwrap();
-            let mut filtered = filter(&cli_args, lines).unwrap();
+            let mut filtered = filter(&cli_args, lines, summary_clone).unwrap();
             for value in filtered.iter_mut() {
                 format_hmacs(value);
             }
@@ -323,16 +338,20 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
         debug_msg!(format!("Count of lines: {}", queue.lock().unwrap().len()));
     }
 
-    output(&cli_args, &queue);
+    output(&cli_args, &queue, &summary);
 
     Ok(())
 }
 
-fn output(cli_args: &Cli, queue: &SharedQueue<Value>) {
+fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
     let json_events = queue.lock().unwrap();
     if json_events.is_empty() {
         err_msg("Nothing found matching the criteria".to_string());
         return;
+    }
+
+    for (path, count) in summary.lock().unwrap().iter() {
+        println!("{path} => {count}");
     }
 
     for json_value in json_events.iter() {
@@ -633,7 +652,10 @@ mod tests {
                 "hmac-sha256:9876543210abcdef"
             ]);
             format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!(["hmac-sha256:abcdef1234", "hmac-sha256:9876543210"]));
+            assert_eq!(
+                json_value,
+                json!(["hmac-sha256:abcdef1234", "hmac-sha256:9876543210"])
+            );
         }
 
         #[test]
