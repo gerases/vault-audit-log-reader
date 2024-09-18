@@ -523,6 +523,7 @@ fn parse_args() -> Cli {
                 .help("HMAC values to track in the log")
                 .required(false)
                 .num_args(1..)
+                .conflicts_with("summary")
                 .value_name("HMAC"),
         )
         .arg(
@@ -542,12 +543,14 @@ fn parse_args() -> Cli {
                 .short('r')
                 .long("raw")
                 .action(clap::ArgAction::SetTrue)
+                .conflicts_with("summary")
                 .help("Print unabridged entries"),
         )
         .arg(
             Arg::new("path")
                 .short('p')
                 .long("path")
+                .conflicts_with("summary")
                 .value_name("VAULT_PATH"),
         )
         .arg(
