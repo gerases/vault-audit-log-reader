@@ -11,8 +11,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
-use std::sync::Once;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
@@ -57,7 +56,7 @@ struct LogEntry<'a> {
 #[derive(Debug, Clone)]
 struct Cli {
     output_raw: bool,
-    responses_only: bool,
+    include_requests: bool,
     // start_time: Option<String>,
     // end_time: Option<String>,
     track: Option<HashSet<String>>,
@@ -92,13 +91,47 @@ fn err_msg(msg: String) {
     error!("ERROR: {}", msg.red());
 }
 
+fn _get_str_from_json<'a>(
+    json_value: &'a Value,
+    keys: &[&str],
+    print_error: bool,
+) -> &'a str {
+    let mut current_val = json_value;
+    for key in keys {
+        current_val = match current_val.get(*key) {
+            Some(json) => json,
+            None => {
+                if print_error {
+                    err_msg(format!("Missing key: {key}"));
+                }
+                return "";
+            }
+        }
+    }
+
+    current_val.as_str().unwrap_or_else(|| {
+        if print_error {
+            err_msg(format!("Invalid value for key path: {:?}", keys));
+        }
+        ""
+    })
+}
+
+fn get_str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
+    _get_str_from_json(json_value, keys, true)
+}
+
+fn get_str_from_json_without_err<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
+    _get_str_from_json(json_value, keys, false)
+}
+
 fn actor(auth: &Value) -> String {
     match auth.get("metadata") {
         Some(value) => match value.get("role_name") {
             Some(role_name) => role_name.as_str().unwrap().to_string(),
-            None => value.get("username").unwrap().as_str().unwrap().to_string(),
+            None => get_str_from_json(&value, &["username"]).to_string(),
         },
-        None => get_str_from_json(auth, "display_name").to_string()
+        None => get_str_from_json(auth, &["display_name"]).to_string(),
     }
 }
 
@@ -268,23 +301,23 @@ fn filter(
         .filter(|json_value: &Value| {
             let event_type = json_value.get("type").unwrap();
             let mut summary = summary.lock().unwrap();
-            let vault_path = json_value
-                .get("request")
-                .unwrap()
-                .get("path")
-                .unwrap()
-                .to_string();
-            *summary.entry(vault_path.clone()).or_insert(0) += 1;
-            if let Some(path) = &cli_args.path {
-                if vault_path.starts_with(path) {
-                    return true;
+            let vault_path = get_str_from_json(&json_value, &["request", "path"]);
+            let err = get_str_from_json_without_err(&json_value, &["error"]);
+            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+            if event_type == "request" {
+                // if an error exists in a request,
+                // show it even if it was not requested
+                if !cli_args.include_requests && err == "" {
+                    return false;
                 }
-            }
-            if cli_args.responses_only && event_type != "response" {
-                return false;
             }
             if !tracked_hmacs.is_empty() && !track_hmacs(&json_value, &mut tracked_hmacs) {
                 return false;
+            }
+            if let Some(path) = &cli_args.path {
+                if !vault_path.starts_with(path) {
+                    return false;
+                }
             }
             return true;
         })
@@ -345,16 +378,6 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
-fn get_str_from_json<'a>(json_value: &'a Value, key: &str) -> &'a str {
-    json_value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| {
-            eprintln!("Missing or invalid value for key: {}", key);
-            ""
-        })
-}
-
 fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
     let json_events = queue.lock().unwrap();
     if json_events.is_empty() {
@@ -384,15 +407,15 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         // let raw_response = json_value.get("response").unwrap();
 
         let request = Request {
-            id: get_str_from_json(&raw_request, "id"),
-            time: get_str_from_json(&json_value, "time"),
-            tok_issue: get_str_from_json(&raw_auth, "token_issue_time"),
+            id: get_str_from_json(&raw_request, &["id"]),
+            time: get_str_from_json(&json_value, &["time"]),
+            tok_issue: get_str_from_json(&raw_auth, &["token_issue_time"]),
             actor: &actor(raw_auth),
-            tok_type:  get_str_from_json(&raw_auth, "token_type"),
-            clnt_tok:  get_str_from_json(&raw_auth, "client_token"),
-            accsr_tok: get_str_from_json(&raw_auth, "accessor"),
-            path:      get_str_from_json(&raw_request, "path"),
-            operation: get_str_from_json(&raw_request, "operation"),
+            tok_type: get_str_from_json(&raw_auth, &["token_type"]),
+            clnt_tok: get_str_from_json(&raw_auth, &["client_token"]),
+            accsr_tok: get_str_from_json(&raw_auth, &["accessor"]),
+            path: get_str_from_json(&raw_request, &["path"]),
+            operation: get_str_from_json(&raw_request, &["operation"]),
             remote_address: &format_ipv4_addr(raw_request.get("remote_address")),
         };
 
@@ -404,10 +427,12 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.output_raw {
             to_writer(&mut stdout, &json_value).unwrap();
+            return;
         }
         to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
             err_msg(format!("Couldn't write a json line to the screen: {error}").into());
         });
+        println!("HEEEEEEEEEEEEEEEEEEEEEEE");
     }
 }
 
@@ -478,11 +503,11 @@ fn parse_args() -> Cli {
                 .help("Limit to a single thread"),
         )
         .arg(
-            Arg::new("responses-only")
+            Arg::new("include-requests")
                 .short('R')
-                .long("responses-only")
+                .long("include-requests")
                 .action(clap::ArgAction::SetTrue)
-                .help("Limit to responses only"),
+                .help("Include requests too"),
         )
         .arg(
             Arg::new("summary")
@@ -542,7 +567,7 @@ fn parse_args() -> Cli {
         log_file: matches.get_one::<String>("log_file").unwrap().clone(),
         single_thread: matches.get_flag("single-thread"),
         output_raw: matches.get_flag("raw"),
-        responses_only: matches.get_flag("responses-only"),
+        include_requests: matches.get_flag("include-requests"),
         summary: matches.get_flag("summary"),
         path: matches.get_one::<String>("path").cloned(),
         track: matches
@@ -554,7 +579,10 @@ fn parse_args() -> Cli {
 fn main() {
     init_logger();
     let args: Cli = parse_args();
-    let _ = process(args.clone());
+    match process(args.clone()) {
+        Ok(_) => {}
+        Err(err) => err_msg(err.to_string()),
+    }
     debug_msg!(format!("The arguments are: {:?}", args));
 }
 
@@ -567,9 +595,10 @@ mod tests {
 
     #[test]
     fn test_find_beginning_of_line() -> std::io::Result<()> {
-        // Create a temporary file with known content
-        init_logger();
+        // uncomment to enable logging in testing
+        // init_logger();
 
+        // Create a temporary file with known content
         let mut file = tempfile()?; // This creates a temporary file that will be cleaned up after the test
         let contents = "First line\nSecond line\nThird line\n";
         write!(file, "{contents}")?;
@@ -618,7 +647,7 @@ mod tests {
             log_file: file.path().to_str().unwrap().to_string(),
             single_thread: false,
             output_raw: false,
-            responses_only: false,
+            include_requests: false,
             summary: false,
             path: None,
             // start_time: String::from("").into(),
@@ -779,6 +808,50 @@ mod tests {
             let result = track_hmacs(&json_value, &mut tracked_hmacs);
             assert_eq!(tracked_hmacs, [tracked_tok].into());
             assert_eq!(result, false);
+        }
+    }
+
+    mod test_get_str_from_json {
+        use super::*;
+
+        #[test]
+        fn with_first_level_key() {
+            let json_value = json!({
+                "key": "value",
+            });
+
+            assert_eq!(get_str_from_json(&json_value, &["key"]), "value");
+        }
+
+        #[test]
+        fn with_second_level_key() {
+            let json_value = json!({
+                "key1": {
+                    "key2": "value",
+                }
+            });
+
+            assert_eq!(get_str_from_json(&json_value, &["key1", "key2"]), "value");
+        }
+
+        #[test]
+        fn with_missing_first_level_key() {
+            let json_value = json!({
+                "key": "value"
+            });
+
+            assert_eq!(get_str_from_json(&json_value, &["wrong"]), "");
+        }
+
+        #[test]
+        fn with_missing_second_level_key() {
+            let json_value = json!({
+                "key1": {
+                    "key2": "value",
+                }
+            });
+
+            assert_eq!(get_str_from_json(&json_value, &["key1", "wrong"]), "");
         }
     }
 }
