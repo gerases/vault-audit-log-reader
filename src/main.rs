@@ -1,3 +1,4 @@
+use chrono::{DateTime, ParseResult, Utc};
 use clap::{Arg, Command};
 use colored::Colorize;
 use log::{debug, error, info};
@@ -43,8 +44,8 @@ struct Request<'a> {
 struct Cli {
     output_raw: bool,
     include_requests: bool,
-    // start_time: Option<String>,
-    // end_time: Option<String>,
+    start_time: Option<String>,
+    end_time: Option<String>,
     track: Option<HashSet<String>>,
     single_thread: bool,
     log_file: String,
@@ -87,11 +88,11 @@ fn err_msg(msg: String) {
     error!("ERROR: {}", msg.red());
 }
 
-fn _get_str_from_json<'a>(
-    json_value: &'a Value,
-    keys: &[&str],
-    print_error: bool,
-) -> &'a str {
+fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
+}
+
+fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> &'a str {
     let mut current_val = json_value;
     for key in keys {
         current_val = match current_val.get(*key) {
@@ -119,6 +120,25 @@ fn get_str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
 
 fn get_str_from_json_without_err<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
     _get_str_from_json(json_value, keys, false)
+}
+
+fn within_time_bounds<F>(timestamp_str: &Option<String>, checker: F) -> bool
+where
+    F: Fn(&chrono::DateTime<chrono::Utc>) -> bool,
+{
+    if let Some(time_str) = timestamp_str {
+        match parse_timestamp(&time_str) {
+            Ok(time) => {
+                checker(&time)
+            }
+            Err(_) => {
+                err_msg(format!("Can't parse {time_str}"));
+                false
+            }
+        }
+    } else {
+        true // If no timestamp is provided, consider it always valid
+    }
 }
 
 fn actor(auth: &Value) -> String {
@@ -335,7 +355,6 @@ fn filter(
             let mut summary = summary.lock().unwrap();
             let vault_path = get_str_from_json(&json_value, &["request", "path"]);
             let err = get_str_from_json_without_err(&json_value, &["error"]);
-            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             if event_type == "request" {
                 // if an error exists in a request,
                 // show it even if it was not requested
@@ -351,10 +370,24 @@ fn filter(
                     return false;
                 }
             }
+            let event_time_str = get_str_from_json(&json_value, &["time"]);
+            let event_time = match parse_timestamp(event_time_str) {
+                Ok(time) => time,
+                Err(err) => {
+                    err_msg(format!("Can't parse {event_time_str}: {err}"));
+                    return false;
+                }
+            };
+            if !within_time_bounds(&cli_args.start_time, |start_time| &event_time >= start_time) {
+                return false;
+            }
+            if !within_time_bounds(&cli_args.end_time, |end_time| &event_time <= end_time) {
+                return false;
+            }
+            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             return true;
         })
         .collect::<Vec<Value>>();
-
     return Ok(result);
 }
 
@@ -436,7 +469,6 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
     for json_value in json_events.iter() {
         let raw_auth = json_value.get("auth").unwrap();
         let raw_request = json_value.get("request").unwrap();
-        // let raw_response = json_value.get("response").unwrap();
 
         let request = Request {
             id: get_str_from_json(&raw_request, &["id"]),
@@ -459,13 +491,16 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.output_raw {
             to_writer(&mut stdout, &json_value).unwrap();
+            println!("");
             return;
         }
         to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
             err_msg(format!("Couldn't write a json line to the screen: {error}").into());
         });
-        println!("HEEEEEEEEEEEEEEEEEEEEEEE");
+        println!("");
     }
+
+    ok_msg(format!("Found {} events", json_events.len()));
 }
 
 fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
@@ -594,8 +629,8 @@ fn parse_args() -> Cli {
         .get_matches();
 
     Cli {
-        // start_time: matches.get_one::<String>("start-time").cloned(),
-        // end_time: matches.get_one::<String>("end-time").cloned(),
+        start_time: matches.get_one::<String>("start-time").cloned(),
+        end_time: matches.get_one::<String>("end-time").cloned(),
         log_file: matches.get_one::<String>("log_file").unwrap().clone(),
         single_thread: matches.get_flag("single-thread"),
         output_raw: matches.get_flag("raw"),
@@ -795,8 +830,8 @@ mod tests {
             include_requests: false,
             summary: false,
             path: None,
-            // start_time: String::from("").into(),
-            // end_time: String::from("").into(),
+            start_time: String::from("").into(),
+            end_time: String::from("").into(),
             track: None,
         };
 
