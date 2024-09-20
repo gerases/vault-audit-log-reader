@@ -1,5 +1,5 @@
 use chrono::{DateTime, ParseResult, Utc};
-use clap::{Arg, Command};
+use clap::{ArgAction, Parser};
 use colored::Colorize;
 use log::{debug, error, info};
 use num_cpus;
@@ -47,17 +47,56 @@ struct LogEntry<'a> {
     request: Request<'a>,
 }
 
-#[derive(Debug, Clone)]
-struct Cli {
-    output_raw: bool,
-    include_requests: bool,
-    start_time: Option<String>,
-    end_time: Option<String>,
-    track: Option<HashSet<String>>,
+#[derive(Parser, Debug, Clone)]
+#[command(name = "Read vault audit log", version = "1.0")]
+struct CliArgs {
+    /// Limit to a single thread
+    #[arg(short = 'S', long = "single-thread", action = ArgAction::SetTrue)]
     single_thread: bool,
-    log_file: String,
-    path: Option<String>,
+
+    /// Include requests too
+    #[arg(short = 'R', long = "include-requests", action = ArgAction::SetTrue)]
+    include_requests: bool,
+
+    /// Show only the summary
+    #[arg(long = "summary", action = ArgAction::SetTrue)]
     summary: bool,
+
+    /// HMAC values to track in the log
+    #[arg(
+        short = 't',
+        long = "track",
+        conflicts_with = "summary",
+        value_name = "HMAC",
+        num_args = 1..
+
+    )]
+    track: Option<Vec<String>>,
+
+    /// Specify beginning time (e.g. 2024-08-16T18:10:16Z)
+    #[arg(short = 's', long = "start-time")]
+    start_time: Option<String>,
+
+    /// Specify end time (e.g. 2024-08-16T18:10:16Z)
+    #[arg(short = 'e', long = "end-time")]
+    end_time: Option<String>,
+
+    /// Print unabridged entries
+    #[arg(short = 'r', long = "raw", action = ArgAction::SetTrue, conflicts_with = "summary")]
+    raw: bool,
+
+    /// Vault path
+    #[arg(
+        short = 'p',
+        long = "path",
+        conflicts_with = "summary",
+        value_name = "VAULT_PATH"
+    )]
+    path: Option<String>,
+
+    /// Log file
+    #[arg(short = 'f', long = "file", value_name = "LOG_FILE", required = true)]
+    log_file: String,
 }
 
 macro_rules! debug_msg {
@@ -81,7 +120,8 @@ pub fn init_logger() {
     INIT.call_once(|| {
         let mut builder = env_logger::Builder::new();
         // Set the default log level to `Info`
-        builder.filter(None, LevelFilter::Info);
+        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        builder.filter(None, log_level.parse().unwrap_or(LevelFilter::Info));
         // Initialize the logger
         builder.init();
     });
@@ -161,23 +201,20 @@ fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Erro
     Ok(hostname)
 }
 
-fn format_ipv4_addr(remote_addr: Option<&Value>) -> String {
-    match remote_addr {
-        Some(value) => match value.as_str() {
-            Some(addr_str) => {
-                let addr: IpAddr = addr_str.parse().unwrap_or_else(|error| {
-                    err_msg(format!("Couldn't parse '{addr_str}': {error}").into());
-                    "0.0.0.0".parse().unwrap()
-                });
-                match resolve_ip_to_hostname(addr) {
-                    Ok(hostname) => hostname,
-                    Err(_) => format!("Can't resolve '{}'", addr_str.to_string()),
-                }
-            }
-            None => String::from("Can't convert to string"),
-        },
-        None => String::from("Remote addr missing"),
+fn format_ipv4_addr(remote_addr: &str) -> String {
+    if remote_addr == "" {
+        return String::from("Remote addr missing");
     }
+
+    let addr: IpAddr = remote_addr.parse().unwrap_or_else(|error| {
+        err_msg(format!("Couldn't parse '{remote_addr}': {error}").into());
+        "0.0.0.0".parse().unwrap()
+    });
+
+    return match resolve_ip_to_hostname(addr) {
+        Ok(hostname) => hostname,
+        Err(_) => format!("Can't resolve '{}'", remote_addr),
+    };
 }
 
 fn format_hmacs(json_obj: &mut Value) {
@@ -265,7 +302,7 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
     return Ok(seek_pos);
 }
 
-fn filter_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<Vec<Value>> {
+fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Result<Vec<String>> {
     let mut file = File::open(&cli_args.log_file)?;
 
     let line_start = match find_beginning_of_line(&mut file, range.start) {
@@ -338,11 +375,17 @@ fn filter_lines(cli_args: &Cli, range: std::ops::Range<u64>) -> std::io::Result<
 }
 
 fn filter(
-    cli_args: &Cli,
+    cli_args: &CliArgs,
     lines: Vec<String>,
     summary: SharedMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
-    let mut tracked_hmacs: HashSet<String> = cli_args.track.clone().unwrap_or(HashSet::new());
+    let mut tracked_hmacs: HashSet<String> = cli_args
+        .track
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
 
     let result = lines
         .into_iter()
@@ -396,7 +439,7 @@ fn filter(
     return Ok(result);
 }
 
-fn process(cli_args: Cli) -> std::io::Result<()> {
+fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     let logical_cores = num_cpus::get();
     let metadata = std::fs::metadata(&cli_args.log_file)?;
     let file_size = metadata.len();
@@ -414,9 +457,9 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     let queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
     let summary: SharedMap<String, usize> = Arc::new(Mutex::new(HashMap::new()));
     ranges.into_iter().for_each(|range| {
-        let cli_args = cli_args.clone();
         let queue_clone = Arc::clone(&queue);
         let summary_clone = Arc::clone(&summary);
+        let cli_args_clone = cli_args.clone();
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
@@ -424,8 +467,8 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
                 thread_id, range
             ));
             let mut queue = queue_clone.lock().unwrap();
-            let lines = read_lines(&cli_args, range.clone()).unwrap();
-            let mut filtered = filter(&cli_args, lines, summary_clone).unwrap();
+            let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
+            let mut filtered = filter(&cli_args_clone, lines, summary_clone).unwrap();
             for value in filtered.iter_mut() {
                 format_hmacs(value);
             }
@@ -448,7 +491,7 @@ fn process(cli_args: Cli) -> std::io::Result<()> {
     Ok(())
 }
 
-fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
+fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
     let json_events = queue.lock().unwrap();
     if json_events.is_empty() {
         err_msg("Nothing found matching the criteria".to_string());
@@ -498,7 +541,7 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
             accsr_tok: get_str_from_json(&raw_auth, &["accessor"]),
             path: get_str_from_json(&raw_request, &["path"]),
             operation: get_str_from_json(&raw_request, &["operation"]),
-            remote_address: &format_ipv4_addr(raw_request.get("remote_address")),
+            remote_address: &format_ipv4_addr(get_str_from_json(&raw_request, &["remote_address"])),
         };
 
         let log_entry = LogEntry {
@@ -508,7 +551,7 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         };
 
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-        if cli_args.output_raw {
+        if cli_args.raw {
             to_writer(&mut stdout, &json_value).unwrap();
             println!("");
             continue;
@@ -586,213 +629,18 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
     return false;
 }
 
-fn parse_args() -> Cli {
-    let matches = Command::new("Read vault audit log")
-        .version("1.0")
-        .arg(
-            Arg::new("single-thread")
-                .short('S')
-                .long("single-thread")
-                .action(clap::ArgAction::SetTrue)
-                .help("Limit to a single thread"),
-        )
-        .arg(
-            Arg::new("include-requests")
-                .short('R')
-                .long("include-requests")
-                .action(clap::ArgAction::SetTrue)
-                .help("Include requests too"),
-        )
-        .arg(
-            Arg::new("summary")
-                .long("summary")
-                .action(clap::ArgAction::SetTrue)
-                .help("Show only the summary"),
-        )
-        .arg(
-            Arg::new("track")
-                .short('t')
-                .long("track")
-                .help("HMAC values to track in the log")
-                .required(false)
-                .num_args(1..)
-                .conflicts_with("summary")
-                .value_name("HMAC"),
-        )
-        .arg(
-            Arg::new("start-time")
-                .short('s')
-                .long("start-time")
-                .help("Specify beginning time (e.g. 2024-08-16T18:10:16Z)"),
-        )
-        .arg(
-            Arg::new("end-time")
-                .short('e')
-                .long("end-time")
-                .help("Specify end time (e.g. 2024-08-16T18:10:16Z)"),
-        )
-        .arg(
-            Arg::new("raw")
-                .short('r')
-                .long("raw")
-                .action(clap::ArgAction::SetTrue)
-                .conflicts_with("summary")
-                .help("Print unabridged entries"),
-        )
-        .arg(
-            Arg::new("path")
-                .short('p')
-                .long("path")
-                .conflicts_with("summary")
-                .value_name("VAULT_PATH"),
-        )
-        .arg(
-            Arg::new("log_file")
-                .short('f')
-                .long("file")
-                .required(true)
-                .value_name("LOG_FILE"),
-        )
-        .get_matches();
-
-    Cli {
-        start_time: matches.get_one::<String>("start-time").cloned(),
-        end_time: matches.get_one::<String>("end-time").cloned(),
-        log_file: matches.get_one::<String>("log_file").unwrap().clone(),
-        single_thread: matches.get_flag("single-thread"),
-        output_raw: matches.get_flag("raw"),
-        include_requests: matches.get_flag("include-requests"),
-        summary: matches.get_flag("summary"),
-        path: matches.get_one::<String>("path").cloned(),
-        track: matches
-            .get_many::<String>("track")
-            .map(|values| values.cloned().collect()),
-    }
-}
-
-fn process(cli_args: Cli) -> std::io::Result<()> {
-    let logical_cores = num_cpus::get();
-    let metadata = std::fs::metadata(&cli_args.log_file)?;
-    let file_size = metadata.len();
-    let num_threads = if cli_args.single_thread {
-        1
-    } else {
-        std::cmp::min(
-            (file_size / MIN_BYTES_PER_THREAD).max(1) as usize,
-            logical_cores,
-        )
-    };
-    debug_msg!(format!("Number of threads is {num_threads}"));
-    let ranges = split_into_ranges(file_size, num_threads);
-    let mut handles: Vec<JoinHandle<usize>> = vec![];
-    ranges.into_iter().for_each(|range| {
-        let cli_args = cli_args.clone();
-        let handle = std::thread::spawn(move || {
-            let thread_id = std::thread::current().id();
-            debug_msg!(format!(
-                "Thread={:?}; Processing range {:?}",
-                thread_id, range
-            ));
-            let result = filter_lines(&cli_args, range.clone());
-            let result = match result {
-                Ok(lines) => lines.len(),
-                Err(err) => {
-                    err_msg(format!(
-                        "can't process byte range {} thru {} of {}: {err}",
-                        range.start, range.end, cli_args.log_file
-                    ));
-                    0
-                }
-            };
-            result
-        });
-        handles.push(handle);
-    });
-
-    let thread_count = handles.len();
-    let sum: usize = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .sum();
-
-    ok_msg(format!("Count of threads: {}", thread_count));
-    ok_msg(format!("Count of lines: {}", sum));
-
-    Ok(())
-}
-
-fn parse_args() -> Cli {
-    let matches = Command::new("Read vault audit log")
-        .version("1.0")
-        .arg(
-            Arg::new("single-thread")
-                .short('S')
-                .long("single-thread")
-                .action(clap::ArgAction::SetTrue)
-                .help("Limit to a single thread"),
-        )
-        .arg(
-            Arg::new("responses-only")
-                .short('R')
-                .long("responses-only")
-                .action(clap::ArgAction::SetTrue)
-                .help("Limit to responses only"),
-        )
-        .arg(
-            Arg::new("track")
-                .short('t')
-                .long("track")
-                .help("HMAC values to track in the log")
-                .num_args(1..)
-                .value_name("HMAC"),
-        )
-        .arg(
-            Arg::new("start-time")
-                .short('s')
-                .long("start-time")
-                .help("Specify beginning time (e.g. 2024-08-16T18:10:16Z)"),
-        )
-        .arg(
-            Arg::new("end-time")
-                .short('e')
-                .long("end-time")
-                .help("Specify end time (e.g. 2024-08-16T18:10:16Z)"),
-        )
-        .arg(
-            Arg::new("raw")
-                .short('r')
-                .long("raw")
-                .action(clap::ArgAction::SetTrue)
-                .help("Print unabridged entries"),
-        )
-        .arg(
-            Arg::new("log_file").required(true).value_name("LOG_FILE"), // This is how it will be referred to in the help message
-        )
-        .get_matches();
-
-    Cli {
-        log_file: matches.get_one::<String>("log_file").unwrap().clone(),
-        single_thread: matches.get_flag("single-thread"),
-        output_raw: matches.get_flag("raw"),
-        responses_only: matches.get_flag("responses-only"),
-        start_time: matches.get_one::<String>("start-time").cloned(),
-        end_time: matches.get_one::<String>("end-time").cloned(),
-        track: matches
-            .get_many::<String>("track")
-            .map(|values| values.cloned().collect()),
-    }
-}
-
 fn main() {
     init_logger();
-    let args: Cli = parse_args();
-    match process(args.clone()) {
+    let cli_args = CliArgs::parse();
+    // let args: Cli = parse_args();
+    match process(&cli_args) {
         Ok(_) => {}
         Err(err) => err_msg(err.to_string()),
     }
-    debug_msg!(format!("The arguments are: {:?}", args));
+    debug_msg!(format!("The arguments are: {:?}", cli_args));
 }
 
+// {{{ TESTS
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,3 +914,4 @@ mod tests {
         }
     }
 }
+// }}}
