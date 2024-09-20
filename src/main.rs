@@ -40,6 +40,13 @@ struct Request<'a> {
     remote_address: &'a str,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct LogEntry<'a> {
+    event_type: &'a str,
+    response: Value,
+    request: Request<'a>,
+}
+
 #[derive(Debug, Clone)]
 struct Cli {
     output_raw: bool,
@@ -128,9 +135,7 @@ where
 {
     if let Some(time_str) = timestamp_str {
         match parse_timestamp(&time_str) {
-            Ok(time) => {
-                checker(&time)
-            }
+            Ok(time) => checker(&time),
             Err(_) => {
                 err_msg(format!("Can't parse {time_str}"));
                 false
@@ -466,14 +471,27 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         return;
     }
 
-    for json_value in json_events.iter() {
+    let mut sorted_vec: Vec<&Value> = json_events.iter().collect();
+    sorted_vec.sort_by(|a, b| {
+        let a_time = parse_timestamp(get_str_from_json(&a, &["time"]));
+        let b_time = parse_timestamp(get_str_from_json(&b, &["time"]));
+        match (a_time, b_time) {
+            (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time), // Compare the actual timestamps
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,     // Treat errors as "earlier"
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,  // Treat errors as "later"
+            (Err(_), Err(_)) => std::cmp::Ordering::Equal,   // Both failed to parse
+        }
+    });
+
+    for json_value in sorted_vec {
         let raw_auth = json_value.get("auth").unwrap();
         let raw_request = json_value.get("request").unwrap();
+        let raw_response = json_value.get("response").unwrap_or(&Value::Null);
 
         let request = Request {
             id: get_str_from_json(&raw_request, &["id"]),
             time: get_str_from_json(&json_value, &["time"]),
-            tok_issue: get_str_from_json(&raw_auth, &["token_issue_time"]),
+            tok_issue: get_str_from_json_without_err(&raw_auth, &["token_issue_time"]),
             actor: &actor(raw_auth),
             tok_type: get_str_from_json(&raw_auth, &["token_type"]),
             clnt_tok: get_str_from_json(&raw_auth, &["client_token"]),
@@ -484,15 +502,16 @@ fn output(cli_args: &Cli, queue: &SharedQueue<Value>, summary: &SharedMap<String
         };
 
         let log_entry = LogEntry {
+            event_type: get_str_from_json(&json_value, &["type"]),
+            response: raw_response.clone(),
             request: request,
-            event_type: json_value.get("type").unwrap().as_str().unwrap(),
         };
 
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.output_raw {
             to_writer(&mut stdout, &json_value).unwrap();
             println!("");
-            return;
+            continue;
         }
         to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
             err_msg(format!("Couldn't write a json line to the screen: {error}").into());
@@ -548,10 +567,18 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
     ]);
     find_hmac_values(event, &mut hmac_values, &include_keys);
 
-    if hmac_values
-        .iter()
-        .any(|hmac| tracked_tokens.iter().any(|token| hmac.starts_with(token)))
-    {
+    if hmac_values.iter().any(|hmac| {
+        tracked_tokens.iter().any(|token| {
+            // if hmac.starts_with(token) {
+            //     println!("{hmac} starts with {token}");
+            // }
+            hmac.starts_with(token)
+        })
+    }) {
+        // println!(
+        //     "Extending:\nwas: {:?}\nnew:{:?}",
+        //     tracked_tokens, hmac_values
+        // );
         tracked_tokens.extend(hmac_values);
         return true;
     }
