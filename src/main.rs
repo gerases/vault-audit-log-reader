@@ -1,6 +1,9 @@
 use chrono::{DateTime, ParseResult, Utc};
 use clap::{ArgAction, Parser};
 use colored::Colorize;
+use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
+use dns_lookup::lookup_addr;
+use log::LevelFilter;
 use log::{debug, error, info};
 use num_cpus;
 use serde::{Deserialize, Serialize};
@@ -50,6 +53,15 @@ struct LogEntry<'a> {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
+    /// Limit to a single thread
+    #[arg(
+        short = 'i',
+        long = "id",
+        value_name = "Request-Id",
+        help = "filter by request id"
+    )]
+    id: Option<String>,
+
     /// Limit to a single thread
     #[arg(short = 'S', long = "single-thread", action = ArgAction::SetTrue)]
     single_thread: bool,
@@ -135,11 +147,16 @@ fn err_msg(msg: String) {
     error!("ERROR: {}", msg.red());
 }
 
+fn err_msg_with_exit(msg: String) {
+    err_msg(msg);
+    std::process::exit(1);
+}
+
 fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
 }
 
-fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> &'a str {
+fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> String {
     let mut current_val = json_value;
     for key in keys {
         current_val = match current_val.get(*key) {
@@ -148,24 +165,31 @@ fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: boo
                 if print_error {
                     err_msg(format!("Missing key: {key}"));
                 }
-                return "";
+                return String::new();
             }
         }
     }
 
-    current_val.as_str().unwrap_or_else(|| {
-        if print_error {
-            err_msg(format!("Invalid value for key path: {:?}", keys));
+    match current_val {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        _ => {
+            if print_error {
+                err_msg(format!(
+                    "Invalid value for key path: {:?}; current_val={:?}",
+                    keys, current_val
+                ));
+            }
+            String::new()
         }
-        ""
-    })
+    }
 }
 
-fn get_str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
+fn get_str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> String {
     _get_str_from_json(json_value, keys, true)
 }
 
-fn get_str_from_json_without_err<'a>(json_value: &'a Value, keys: &[&str]) -> &'a str {
+fn get_str_from_json_without_err<'a>(json_value: &'a Value, keys: &[&str]) -> String {
     _get_str_from_json(json_value, keys, false)
 }
 
@@ -194,6 +218,49 @@ fn actor(auth: &Value) -> String {
         },
         None => get_str_from_json(auth, &["display_name"]).to_string(),
     }
+}
+
+fn path(request: &Value) -> String {
+    return get_str_from_json(&request, &["path"])
+        .to_string()
+        .replace("sys/internal/ui/mounts/", "");
+}
+
+fn req_id(request: &Value) -> String {
+    let id = get_str_from_json(&request, &["id"]);
+    return id.chars().take(8).collect();
+}
+
+fn format_hmac(token: &str) -> String {
+    let replaced = token.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
+    // the string 'hmac:' is 5 letters
+    return replaced
+        .chars()
+        .take(HMAC_LEN + HMAC_PFX_SHORT.len())
+        .collect();
+}
+
+fn tokens(request: &Value) -> String {
+    // # client_token": "hmac-sha256:86cfc430c2",
+    // # "client_token_accessor
+    let client_token = format_hmac(&get_str_from_json_without_err(&request, &["client_token"]));
+    let client_token_accessor = format_hmac(&get_str_from_json_without_err(
+        &request,
+        &["client_token_accessor"],
+    ));
+    return format!("{client_token}\n{client_token_accessor}");
+}
+
+fn col2idx(table: &Table, title: &str) -> usize {
+    // Get the index of a column by title
+    let header = table.header().unwrap();
+    for (idx, col) in header.cell_iter().enumerate() {
+        if col.content() == title {
+            return idx;
+        }
+    }
+    err_msg_with_exit(format!("Can't find a header column with title='{title}'"));
+    return 0;
 }
 
 fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
@@ -379,13 +446,10 @@ fn filter(
     lines: Vec<String>,
     summary: SharedMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
-    let mut tracked_hmacs: HashSet<String> = cli_args
-        .track
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|x| x.to_string())
-        .collect();
+    let mut tracked_hmacs: HashSet<String> = match &cli_args.track {
+        Some(hmacs) => hmacs.iter().map(|x| x.to_string()).collect(),
+        None => HashSet::new(), // or handle as needed, e.g., return an error
+    };
 
     let result = lines
         .into_iter()
@@ -419,7 +483,7 @@ fn filter(
                 }
             }
             let event_time_str = get_str_from_json(&json_value, &["time"]);
-            let event_time = match parse_timestamp(event_time_str) {
+            let event_time = match parse_timestamp(&event_time_str) {
                 Ok(time) => time,
                 Err(err) => {
                     err_msg(format!("Can't parse {event_time_str}: {err}"));
@@ -483,8 +547,8 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         handle.join().unwrap_or_else(|error| {
             err_msg(format!("Error waiting for thread to join: {:?}", error));
         });
-        debug_msg!(format!("Count of lines: {}", queue.lock().unwrap().len()));
     }
+    debug_msg!(format!("Count of lines: {}", queue.lock().unwrap().len()));
 
     output(&cli_args, &queue, &summary);
 
@@ -516,8 +580,8 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
 
     let mut sorted_vec: Vec<&Value> = json_events.iter().collect();
     sorted_vec.sort_by(|a, b| {
-        let a_time = parse_timestamp(get_str_from_json(&a, &["time"]));
-        let b_time = parse_timestamp(get_str_from_json(&b, &["time"]));
+        let a_time = parse_timestamp(&get_str_from_json(&a, &["time"]));
+        let b_time = parse_timestamp(&get_str_from_json(&b, &["time"]));
         match (a_time, b_time) {
             (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time), // Compare the actual timestamps
             (Err(_), Ok(_)) => std::cmp::Ordering::Less,     // Treat errors as "earlier"
@@ -526,29 +590,13 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         }
     });
 
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+
     for json_value in sorted_vec {
         let raw_auth = json_value.get("auth").unwrap();
         let raw_request = json_value.get("request").unwrap();
-        let raw_response = json_value.get("response").unwrap_or(&Value::Null);
-
-        let request = Request {
-            id: get_str_from_json(&raw_request, &["id"]),
-            time: get_str_from_json(&json_value, &["time"]),
-            tok_issue: get_str_from_json_without_err(&raw_auth, &["token_issue_time"]),
-            actor: &actor(raw_auth),
-            tok_type: get_str_from_json(&raw_auth, &["token_type"]),
-            clnt_tok: get_str_from_json(&raw_auth, &["client_token"]),
-            accsr_tok: get_str_from_json(&raw_auth, &["accessor"]),
-            path: get_str_from_json(&raw_request, &["path"]),
-            operation: get_str_from_json(&raw_request, &["operation"]),
-            remote_address: &format_ipv4_addr(get_str_from_json(&raw_request, &["remote_address"])),
-        };
-
-        let log_entry = LogEntry {
-            event_type: get_str_from_json(&json_value, &["type"]),
-            response: raw_response.clone(),
-            request: request,
-        };
+        // let raw_response = json_value.get("response").unwrap_or(&Value::Null);
 
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.raw {
@@ -556,10 +604,35 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
             println!("");
             continue;
         }
-        to_writer(&mut stdout, &log_entry).unwrap_or_else(|error| {
-            err_msg(format!("Couldn't write a json line to the screen: {error}").into());
-        });
-        println!("");
+
+        table.set_header(vec![
+            "ReqId", "Time", "Actor", "Tokens", "Op", "Success", "Path",
+        ]);
+        table.add_row(vec![
+            Cell::new(&req_id(&raw_request)),
+            Cell::new(&get_str_from_json(&json_value, &["time"])),
+            Cell::new(&actor(&raw_auth)),
+            Cell::new(&tokens(&raw_request)),
+            Cell::new(&get_str_from_json(&raw_request, &["operation"])),
+            Cell::new(&get_str_from_json(
+                &raw_auth,
+                &["policy_results", "allowed"],
+            )),
+            Cell::new(&path(&raw_request)),
+        ]);
+    }
+
+    if !cli_args.raw {
+        table
+            .column_mut(col2idx(&table, "Time"))
+            .unwrap()
+            .set_constraint(ColumnConstraint::Absolute(Width::Fixed(12)));
+        // path
+        table
+            .column_mut(col2idx(&table, "Path"))
+            .unwrap()
+            .set_constraint(ColumnConstraint::Absolute(Width::Fixed(40)));
+        println!("{table}");
     }
 
     ok_msg(format!("Found {} events", json_events.len()));
