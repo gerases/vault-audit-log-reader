@@ -53,14 +53,21 @@ struct LogEntry<'a> {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
-    /// Limit to a single thread
+    /// Limit to a request with a given id
     #[arg(
-        short = 'i',
         long = "id",
         value_name = "Request-Id",
         help = "filter by request id"
     )]
     id: Option<String>,
+
+    /// Limit to requests with a given client id
+    #[arg(
+        long = "client-id",
+        value_name = "Client-Id",
+        help = "filter by client id"
+    )]
+    client_id: Option<String>,
 
     /// Limit to a single thread
     #[arg(short = 'S', long = "single-thread", action = ArgAction::SetTrue)]
@@ -226,8 +233,7 @@ fn path(request: &Value) -> String {
         .replace("sys/internal/ui/mounts/", "");
 }
 
-fn req_id(request: &Value) -> String {
-    let id = get_str_from_json(&request, &["id"]);
+fn format_id(id: &str) -> String {
     return id.chars().take(8).collect();
 }
 
@@ -240,15 +246,28 @@ fn format_hmac(token: &str) -> String {
         .collect();
 }
 
-fn tokens(request: &Value) -> String {
-    // # client_token": "hmac-sha256:86cfc430c2",
-    // # "client_token_accessor
-    let client_token = format_hmac(&get_str_from_json_without_err(&request, &["client_token"]));
-    let client_token_accessor = format_hmac(&get_str_from_json_without_err(
-        &request,
-        &["client_token_accessor"],
+fn tokens(event_json: &Value) -> String {
+    let auth_token = format_hmac(&get_str_from_json_without_err(&event_json, &["auth", "client_token"]));
+    let auth_accessor = format_hmac(&get_str_from_json_without_err(
+        &event_json,
+        &["auth", "accessor"],
     ));
-    return format!("{client_token}\n{client_token_accessor}");
+    let common = format!("auth-tok:{auth_token}\nauth-acc:{auth_accessor}");
+    match get_str_from_json_without_err(&event_json, &["response", "auth", "accessor"]).len() {
+        0 => {
+            let req_client_token = format_hmac(&get_str_from_json(&event_json, &["request", "client_token"]));
+            let req_accessor = format_hmac(&get_str_from_json(
+                &event_json,
+                &["request", "client_token_accessor"],
+            ));
+            return format!(
+                "{common}\nreq-tok:{req_client_token}\nreq-acc:{req_accessor}"
+            );
+        }
+        _ => {
+            return common;
+        },
+    }
 }
 
 fn col2idx(table: &Table, title: &str) -> usize {
@@ -496,6 +515,18 @@ fn filter(
             if !within_time_bounds(&cli_args.end_time, |end_time| &event_time <= end_time) {
                 return false;
             }
+            if let Some(id) = &cli_args.id {
+                let req_id = get_str_from_json(&json_value, &["request", "id"]);
+                if ! req_id.starts_with(id) {
+                    return false;
+                }
+            }
+            if let Some(cli_client_id) = &cli_args.client_id {
+                let client_id = get_str_from_json_without_err(&json_value, &["request", "client_id"]);
+                if ! client_id.starts_with(&*cli_client_id) {
+                    return false;
+                }
+            }
             *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             return true;
         })
@@ -606,18 +637,16 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         }
 
         table.set_header(vec![
-            "ReqId", "Time", "Actor", "Tokens", "Op", "Success", "Path",
+            "ReqId", "ClientId", "Time", "Src IP", "Actor", "Tokens", "Op", "Path",
         ]);
         table.add_row(vec![
-            Cell::new(&req_id(&raw_request)),
+            Cell::new(&format_id(&get_str_from_json(&raw_request, &["id"]))),
+            Cell::new(&format_id(&get_str_from_json_without_err(&raw_request, &["client_id"]))),
             Cell::new(&get_str_from_json(&json_value, &["time"])),
+            Cell::new(&get_str_from_json(&raw_request, &["remote_address"])),
             Cell::new(&actor(&raw_auth)),
-            Cell::new(&tokens(&raw_request)),
+            Cell::new(&tokens(&json_value)),
             Cell::new(&get_str_from_json(&raw_request, &["operation"])),
-            Cell::new(&get_str_from_json(
-                &raw_auth,
-                &["policy_results", "allowed"],
-            )),
             Cell::new(&path(&raw_request)),
         ]);
     }
