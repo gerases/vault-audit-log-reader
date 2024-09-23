@@ -54,11 +54,7 @@ struct LogEntry<'a> {
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
     /// Limit to a request with a given id
-    #[arg(
-        long = "id",
-        value_name = "Request-Id",
-        help = "filter by request id"
-    )]
+    #[arg(long = "id", value_name = "Request-Id", help = "filter by request id")]
     id: Option<String>,
 
     /// Limit to requests with a given client id
@@ -240,14 +236,14 @@ fn format_id(id: &str) -> String {
 fn format_hmac(token: &str) -> String {
     let replaced = token.replace(HMAC_PFX_LONG, "");
     // the string 'hmac:' is 5 letters
-    return replaced
-        .chars()
-        .take(HMAC_LEN)
-        .collect();
+    return replaced.chars().take(HMAC_LEN).collect();
 }
 
 fn tokens(event_json: &Value) -> String {
-    let auth_token = format_hmac(&get_str_from_json_without_err(&event_json, &["auth", "client_token"]));
+    let auth_token = format_hmac(&get_str_from_json_without_err(
+        &event_json,
+        &["auth", "client_token"],
+    ));
     let auth_accessor = format_hmac(&get_str_from_json_without_err(
         &event_json,
         &["auth", "accessor"],
@@ -255,18 +251,19 @@ fn tokens(event_json: &Value) -> String {
     let common = format!("ath-tok:{auth_token}\nath-acc:{auth_accessor}");
     match get_str_from_json_without_err(&event_json, &["response", "auth", "accessor"]).len() {
         0 => {
-            let req_client_token = format_hmac(&get_str_from_json(&event_json, &["request", "client_token"]));
+            let req_client_token = format_hmac(&get_str_from_json(
+                &event_json,
+                &["request", "client_token"],
+            ));
             let req_accessor = format_hmac(&get_str_from_json(
                 &event_json,
                 &["request", "client_token_accessor"],
             ));
-            return format!(
-                "{common}\nreq-tok:{req_client_token}\nreq-acc:{req_accessor}"
-            );
+            return format!("{common}\nreq-tok:{req_client_token}\nreq-acc:{req_accessor}");
         }
         _ => {
             return common;
-        },
+        }
     }
 }
 
@@ -439,7 +436,7 @@ fn filter(
 ) -> std::io::Result<Vec<Value>> {
     let mut tracked_hmacs: HashSet<String> = match &cli_args.track {
         Some(hmacs) => hmacs.iter().map(|x| x.to_string()).collect(),
-        None => HashSet::new(), // or handle as needed, e.g., return an error
+        None => HashSet::new(),
     };
 
     let result = lines
@@ -458,6 +455,10 @@ fn filter(
             let mut summary = summary.lock().unwrap();
             let vault_path = get_str_from_json(&json_value, &["request", "path"]);
             let err = get_str_from_json_without_err(&json_value, &["error"]);
+
+            // The summary should capture all of the events before any filtering
+            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+
             if event_type == "request" {
                 // if an error exists in a request,
                 // show it even if it was not requested
@@ -489,17 +490,17 @@ fn filter(
             }
             if let Some(id) = &cli_args.id {
                 let req_id = get_str_from_json(&json_value, &["request", "id"]);
-                if ! req_id.starts_with(id) {
+                if !req_id.starts_with(id) {
                     return false;
                 }
             }
             if let Some(cli_client_id) = &cli_args.client_id {
-                let client_id = get_str_from_json_without_err(&json_value, &["request", "client_id"]);
-                if ! client_id.starts_with(&*cli_client_id) {
+                let client_id =
+                    get_str_from_json_without_err(&json_value, &["request", "client_id"]);
+                if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
             }
-            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             return true;
         })
         .collect::<Vec<Value>>();
@@ -555,6 +556,30 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     Ok(())
 }
 
+fn show_summary(summary: &SharedMap<String, usize>) {
+    let mut sorted_vec: Vec<(String, usize)> = summary
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
+
+    sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "Path", "NumReq",
+    ]);
+    for (path, count) in sorted_vec.into_iter().take(10) {
+        table.add_row(vec![
+            Cell::new(path),
+            Cell::new(count),
+        ]);
+    }
+    println!("{table}");
+}
+
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
     let json_events = queue.lock().unwrap();
     if json_events.is_empty() {
@@ -563,18 +588,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     }
 
     if cli_args.summary {
-        let mut sorted_vec: Vec<(String, usize)> = summary
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
-
-        sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
-
-        for (path, count) in sorted_vec {
-            println!("{path} => {count}");
-        }
+        show_summary(summary);
         return;
     }
 
@@ -610,7 +624,10 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         ]);
         table.add_row(vec![
             Cell::new(&format_id(&get_str_from_json(&raw_request, &["id"]))),
-            Cell::new(&format_id(&get_str_from_json_without_err(&raw_request, &["client_id"]))),
+            Cell::new(&format_id(&get_str_from_json_without_err(
+                &raw_request,
+                &["client_id"],
+            ))),
             Cell::new(&get_str_from_json(&json_value, &["time"])),
             Cell::new(&get_str_from_json(&raw_request, &["remote_address"])),
             Cell::new(&actor(&raw_auth)),
