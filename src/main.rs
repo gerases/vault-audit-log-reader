@@ -229,11 +229,11 @@ fn format_id(id: &str) -> String {
 }
 
 fn format_hmac(token: &str) -> String {
-    let replaced = token.replace(HMAC_PFX_LONG, HMAC_PFX_SHORT);
+    let replaced = token.replace(HMAC_PFX_LONG, "");
     // the string 'hmac:' is 5 letters
     return replaced
         .chars()
-        .take(HMAC_LEN + HMAC_PFX_SHORT.len())
+        .take(HMAC_LEN)
         .collect();
 }
 
@@ -243,7 +243,7 @@ fn tokens(event_json: &Value) -> String {
         &event_json,
         &["auth", "accessor"],
     ));
-    let common = format!("auth-tok:{auth_token}\nauth-acc:{auth_accessor}");
+    let common = format!("ath-tok:{auth_token}\nath-acc:{auth_accessor}");
     match get_str_from_json_without_err(&event_json, &["response", "auth", "accessor"]).len() {
         0 => {
             let req_client_token = format_hmac(&get_str_from_json(&event_json, &["request", "client_token"]));
@@ -292,34 +292,6 @@ fn format_ipv4_addr(remote_addr: &str) -> String {
         Ok(hostname) => hostname,
         Err(_) => format!("Can't resolve '{}'", remote_addr),
     };
-}
-
-fn format_hmacs(json_obj: &mut Value) {
-    match json_obj {
-        Value::Object(map) => {
-            for (_, val) in map.iter_mut() {
-                format_hmacs(val);
-            }
-        }
-        Value::Array(arr) => {
-            for val in arr.iter_mut() {
-                format_hmacs(val);
-            }
-        }
-        Value::String(s) => {
-            if s.starts_with("hmac-sha256:") {
-                let replaced = s.replace("hmac-sha256:", HMAC_PFX);
-                // the string 'hmac:' is 5 letters
-                *s = replaced
-                    .chars()
-                    .take(HMAC_LEN + HMAC_PFX_SHORT.len())
-                    .collect();
-            }
-        }
-        _ => {
-            // do nothing for everything else
-        }
-    }
 }
 
 fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
@@ -518,10 +490,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
             ));
             let mut queue = queue_clone.lock().unwrap();
             let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
-            let mut filtered = filter(&cli_args_clone, lines, summary_clone).unwrap();
-            for value in filtered.iter_mut() {
-                format_hmacs(value);
-            }
+            let filtered = filter(&cli_args_clone, lines, summary_clone).unwrap();
             queue.extend(filtered);
         });
         handles.push(handle);
@@ -669,16 +638,13 @@ fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
 
     if hmac_values.iter().any(|hmac| {
         tracked_tokens.iter().any(|token| {
-            // if hmac.starts_with(token) {
-            //     println!("{hmac} starts with {token}");
-            // }
-            hmac.starts_with(token)
+            // remove the prefix from the tokens before
+            // comparing them
+            let _hmac = hmac.replace(HMAC_PFX_LONG, "");
+            let _token = token.replace(HMAC_PFX_LONG, "");
+            _hmac.starts_with(&_token)
         })
     }) {
-        // println!(
-        //     "Extending:\nwas: {:?}\nnew:{:?}",
-        //     tracked_tokens, hmac_values
-        // );
         tracked_tokens.extend(hmac_values);
         return true;
     }
