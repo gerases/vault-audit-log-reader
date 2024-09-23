@@ -159,7 +159,7 @@ fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
 }
 
-fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> String {
+fn _str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> String {
     let mut current_val = json_value;
     for key in keys {
         current_val = match current_val.get(*key) {
@@ -188,12 +188,12 @@ fn _get_str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: boo
     }
 }
 
-fn get_str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> String {
-    _get_str_from_json(json_value, keys, true)
+fn str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> String {
+    _str_from_json(json_value, keys, true)
 }
 
-fn get_str_from_json_without_err<'a>(json_value: &'a Value, keys: &[&str]) -> String {
-    _get_str_from_json(json_value, keys, false)
+fn str_from_json_no_err<'a>(json_value: &'a Value, keys: &[&str]) -> String {
+    _str_from_json(json_value, keys, false)
 }
 
 fn within_time_bounds<F>(timestamp_str: &Option<String>, checker: F) -> bool
@@ -217,14 +217,14 @@ fn actor(auth: &Value) -> String {
     match auth.get("metadata") {
         Some(value) => match value.get("role_name") {
             Some(role_name) => role_name.as_str().unwrap().to_string(),
-            None => get_str_from_json(&value, &["username"]).to_string(),
+            None => str_from_json(&value, &["username"]).to_string(),
         },
-        None => get_str_from_json(auth, &["display_name"]).to_string(),
+        None => str_from_json(auth, &["display_name"]).to_string(),
     }
 }
 
 fn path(request: &Value) -> String {
-    return get_str_from_json(&request, &["path"])
+    return str_from_json(&request, &["path"])
         .to_string()
         .replace("sys/internal/ui/mounts/", "");
 }
@@ -240,22 +240,17 @@ fn format_hmac(token: &str) -> String {
 }
 
 fn tokens(event_json: &Value) -> String {
-    let auth_token = format_hmac(&get_str_from_json_without_err(
+    let auth_token = format_hmac(&str_from_json_no_err(
         &event_json,
         &["auth", "client_token"],
     ));
-    let auth_accessor = format_hmac(&get_str_from_json_without_err(
-        &event_json,
-        &["auth", "accessor"],
-    ));
+    let auth_accessor = format_hmac(&str_from_json_no_err(&event_json, &["auth", "accessor"]));
     let common = format!("ath-tok:{auth_token}\nath-acc:{auth_accessor}");
-    match get_str_from_json_without_err(&event_json, &["response", "auth", "accessor"]).len() {
+    match str_from_json_no_err(&event_json, &["response", "auth", "accessor"]).len() {
         0 => {
-            let req_client_token = format_hmac(&get_str_from_json(
-                &event_json,
-                &["request", "client_token"],
-            ));
-            let req_accessor = format_hmac(&get_str_from_json(
+            let req_client_token =
+                format_hmac(&str_from_json(&event_json, &["request", "client_token"]));
+            let req_accessor = format_hmac(&str_from_json(
                 &event_json,
                 &["request", "client_token_accessor"],
             ));
@@ -451,17 +446,18 @@ fn filter(
             }
         })
         .filter(|json_value: &Value| {
-            let event_type = get_str_from_json(&json_value, &["type"]);
+            let event_type = str_from_json(&json_value, &["type"]);
             let mut summary = summary.lock().unwrap();
-            let vault_path = get_str_from_json(&json_value, &["request", "path"]);
-            let err = get_str_from_json_without_err(&json_value, &["error"]);
+            let vault_path = str_from_json(&json_value, &["request", "path"]);
+            let err = str_from_json_no_err(&json_value, &["error"]);
 
             // The summary should capture all of the events before any
             // filtering. If requests are included, then only the path in the
             // request events should be counted. This is to prevent
             // double-counting by looking at both the request and the
             // response.
-            let should_update_summary = !cli_args.include_requests || event_type.as_str() == "request";
+            let should_update_summary =
+                !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             }
@@ -481,7 +477,7 @@ fn filter(
                     return false;
                 }
             }
-            let event_time_str = get_str_from_json(&json_value, &["time"]);
+            let event_time_str = str_from_json(&json_value, &["time"]);
             let event_time = match parse_timestamp(&event_time_str) {
                 Ok(time) => time,
                 Err(err) => {
@@ -496,14 +492,13 @@ fn filter(
                 return false;
             }
             if let Some(id) = &cli_args.id {
-                let req_id = get_str_from_json(&json_value, &["request", "id"]);
+                let req_id = str_from_json(&json_value, &["request", "id"]);
                 if !req_id.starts_with(id) {
                     return false;
                 }
             }
             if let Some(cli_client_id) = &cli_args.client_id {
-                let client_id =
-                    get_str_from_json_without_err(&json_value, &["request", "client_id"]);
+                let client_id = str_from_json_no_err(&json_value, &["request", "client_id"]);
                 if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
@@ -575,14 +570,9 @@ fn show_summary(summary: &SharedMap<String, usize>) {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        "Path", "NumReq",
-    ]);
+    table.set_header(vec!["Path", "NumReq"]);
     for (path, count) in sorted_vec.into_iter().take(10) {
-        table.add_row(vec![
-            Cell::new(path),
-            Cell::new(count),
-        ]);
+        table.add_row(vec![Cell::new(path), Cell::new(count)]);
     }
     println!("{table}");
 }
@@ -601,8 +591,8 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
 
     let mut sorted_vec: Vec<&Value> = json_events.iter().collect();
     sorted_vec.sort_by(|a, b| {
-        let a_time = parse_timestamp(&get_str_from_json(&a, &["time"]));
-        let b_time = parse_timestamp(&get_str_from_json(&b, &["time"]));
+        let a_time = parse_timestamp(&str_from_json(&a, &["time"]));
+        let b_time = parse_timestamp(&str_from_json(&b, &["time"]));
         match (a_time, b_time) {
             (Ok(a_time), Ok(b_time)) => a_time.cmp(&b_time), // Compare the actual timestamps
             (Err(_), Ok(_)) => std::cmp::Ordering::Less,     // Treat errors as "earlier"
@@ -617,7 +607,6 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     for json_value in sorted_vec {
         let raw_auth = json_value.get("auth").unwrap();
         let raw_request = json_value.get("request").unwrap();
-        // let raw_response = json_value.get("response").unwrap_or(&Value::Null);
 
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.raw {
@@ -626,25 +615,52 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
             continue;
         }
 
-        table.set_header(vec![
+        let mut headers = vec![
             "ReqId", "ClientId", "Time", "Src IP", "Actor", "Tokens", "Op", "Path",
-        ]);
-        table.add_row(vec![
-            Cell::new(&format_id(&get_str_from_json(&raw_request, &["id"]))),
-            Cell::new(&format_id(&get_str_from_json_without_err(
+        ];
+        if cli_args.include_requests {
+            headers.insert(0, "Type");
+        }
+        table.set_header(headers);
+        let mut row = vec![
+            Cell::new(&format_id(&str_from_json(&raw_request, &["id"]))),
+            Cell::new(&format_id(&str_from_json_no_err(
                 &raw_request,
                 &["client_id"],
             ))),
-            Cell::new(&get_str_from_json(&json_value, &["time"])),
-            Cell::new(&get_str_from_json(&raw_request, &["remote_address"])),
+            Cell::new(&str_from_json(&json_value, &["time"])),
+            Cell::new(&str_from_json(&raw_request, &["remote_address"])),
             Cell::new(&actor(&raw_auth)),
             Cell::new(&tokens(&json_value)),
-            Cell::new(&get_str_from_json(&raw_request, &["operation"])),
+            Cell::new(&str_from_json(&raw_request, &["operation"])),
             Cell::new(&path(&raw_request)),
-        ]);
+        ];
+
+        let event_type = str_from_json(&json_value, &["type"]);
+        if cli_args.include_requests {
+            row.insert(
+                0,
+                Cell::new(match event_type.as_str() {
+                    "request" => "req".to_string(),
+                    "response" => "repl".to_string(),
+                    &_ => {
+                        err_msg("Unexpected type: {}".into());
+                        "".to_string()
+                    }
+                }),
+            );
+        }
+
+        table.add_row(row);
     }
 
     if !cli_args.raw {
+        if cli_args.include_requests {
+            table
+                .column_mut(col2idx(&table, "Type"))
+                .unwrap()
+                .set_constraint(ColumnConstraint::Absolute(Width::Fixed(3)));
+        }
         table
             .column_mut(col2idx(&table, "Time"))
             .unwrap()
@@ -653,7 +669,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         table
             .column_mut(col2idx(&table, "Path"))
             .unwrap()
-            .set_constraint(ColumnConstraint::Absolute(Width::Fixed(40)));
+            .set_constraint(ColumnConstraint::Absolute(Width::Fixed(35)));
         println!("{table}");
     }
 
@@ -971,7 +987,7 @@ mod tests {
                 "key": "value",
             });
 
-            assert_eq!(get_str_from_json(&json_value, &["key"]), "value");
+            assert_eq!(str_from_json(&json_value, &["key"]), "value");
         }
 
         #[test]
@@ -982,7 +998,7 @@ mod tests {
                 }
             });
 
-            assert_eq!(get_str_from_json(&json_value, &["key1", "key2"]), "value");
+            assert_eq!(str_from_json(&json_value, &["key1", "key2"]), "value");
         }
 
         #[test]
@@ -991,7 +1007,7 @@ mod tests {
                 "key": "value"
             });
 
-            assert_eq!(get_str_from_json(&json_value, &["wrong"]), "");
+            assert_eq!(str_from_json(&json_value, &["wrong"]), "");
         }
 
         #[test]
@@ -1002,7 +1018,7 @@ mod tests {
                 }
             });
 
-            assert_eq!(get_str_from_json(&json_value, &["key1", "wrong"]), "");
+            assert_eq!(str_from_json(&json_value, &["key1", "wrong"]), "");
         }
     }
 }
