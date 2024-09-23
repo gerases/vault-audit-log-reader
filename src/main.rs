@@ -451,13 +451,20 @@ fn filter(
             }
         })
         .filter(|json_value: &Value| {
-            let event_type = json_value.get("type").unwrap();
+            let event_type = get_str_from_json(&json_value, &["type"]);
             let mut summary = summary.lock().unwrap();
             let vault_path = get_str_from_json(&json_value, &["request", "path"]);
             let err = get_str_from_json_without_err(&json_value, &["error"]);
 
-            // The summary should capture all of the events before any filtering
-            *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+            // The summary should capture all of the events before any
+            // filtering. If requests are included, then only the path in the
+            // request events should be counted. This is to prevent
+            // double-counting by looking at both the request and the
+            // response.
+            let should_update_summary = !cli_args.include_requests || event_type.as_str() == "request";
+            if should_update_summary {
+                *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+            }
 
             if event_type == "request" {
                 // if an error exists in a request,
