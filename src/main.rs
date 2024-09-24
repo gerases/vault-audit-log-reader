@@ -150,8 +150,8 @@ fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
 }
 
-fn _str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -> String {
-    let mut current_val = json_value;
+fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -> String {
+    let mut current_val = event_json;
     for key in keys {
         current_val = match current_val.get(*key) {
             Some(json) => json,
@@ -179,12 +179,12 @@ fn _str_from_json<'a>(json_value: &'a Value, keys: &[&str], print_error: bool) -
     }
 }
 
-fn str_from_json<'a>(json_value: &'a Value, keys: &[&str]) -> String {
-    _str_from_json(json_value, keys, true)
+fn str_from_json<'a>(event_json: &'a Value, keys: &[&str]) -> String {
+    _str_from_json(event_json, keys, true)
 }
 
-fn str_from_json_no_err<'a>(json_value: &'a Value, keys: &[&str]) -> String {
-    _str_from_json(json_value, keys, false)
+fn str_from_json_no_err<'a>(event_json: &'a Value, keys: &[&str]) -> String {
+    _str_from_json(event_json, keys, false)
 }
 
 fn within_time_bounds<F>(timestamp_str: &Option<String>, checker: F) -> bool
@@ -412,11 +412,11 @@ fn filter(
                 None
             }
         })
-        .filter(|json_value: &Value| {
-            let event_type = str_from_json(&json_value, &["type"]);
+        .filter(|event_json: &Value| {
+            let event_type = str_from_json(&event_json, &["type"]);
             let mut summary = summary.lock().unwrap();
-            let vault_path = str_from_json(&json_value, &["request", "path"]);
-            let err = str_from_json_no_err(&json_value, &["error"]);
+            let vault_path = str_from_json(&event_json, &["request", "path"]);
+            let err = str_from_json_no_err(&event_json, &["error"]);
 
             // The summary should capture all of the events before any
             // filtering. If requests are included, then only the path in the
@@ -436,7 +436,7 @@ fn filter(
                     return false;
                 }
             }
-            if !tracked_hmacs.is_empty() && !track_hmacs(&json_value, &mut tracked_hmacs) {
+            if !tracked_hmacs.is_empty() && !track_hmacs(&event_json, &mut tracked_hmacs) {
                 return false;
             }
             if let Some(path) = &cli_args.path {
@@ -444,7 +444,7 @@ fn filter(
                     return false;
                 }
             }
-            let event_time_str = str_from_json(&json_value, &["time"]);
+            let event_time_str = str_from_json(&event_json, &["time"]);
             let event_time = match parse_timestamp(&event_time_str) {
                 Ok(time) => time,
                 Err(err) => {
@@ -459,13 +459,13 @@ fn filter(
                 return false;
             }
             if let Some(id) = &cli_args.id {
-                let req_id = str_from_json(&json_value, &["request", "id"]);
+                let req_id = str_from_json(&event_json, &["request", "id"]);
                 if !req_id.starts_with(id) {
                     return false;
                 }
             }
             if let Some(cli_client_id) = &cli_args.client_id {
-                let client_id = str_from_json_no_err(&json_value, &["request", "client_id"]);
+                let client_id = str_from_json_no_err(&event_json, &["request", "client_id"]);
                 if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
@@ -571,10 +571,10 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
 
-    for json_value in sorted_vec {
+    for event_json in sorted_vec {
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.raw {
-            to_writer(&mut stdout, &json_value).unwrap();
+            to_writer(&mut stdout, &event_json).unwrap();
             println!("");
             continue;
         }
@@ -587,20 +587,20 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         }
         table.set_header(headers);
         let mut row = vec![
-            Cell::new(&format_id(&str_from_json(&json_value, &["request", "id"]))),
+            Cell::new(&format_id(&str_from_json(&event_json, &["request", "id"]))),
             Cell::new(&format_id(&str_from_json_no_err(
-                &json_value,
+                &event_json,
                 &["request", "client_id"],
             ))),
-            Cell::new(&str_from_json(&json_value, &["time"])),
-            Cell::new(&str_from_json(&json_value, &["request", "remote_address"])),
-            Cell::new(&actor(&json_value)),
-            Cell::new(&tokens(&json_value)),
-            Cell::new(&str_from_json(&json_value, &["request", "operation"])),
-            Cell::new(&str_from_json(&json_value, &["request", "path"])),
+            Cell::new(&str_from_json(&event_json, &["time"])),
+            Cell::new(&str_from_json(&event_json, &["request", "remote_address"])),
+            Cell::new(&actor(&event_json)),
+            Cell::new(&tokens(&event_json)),
+            Cell::new(&str_from_json(&event_json, &["request", "operation"])),
+            Cell::new(&str_from_json(&event_json, &["request", "path"])),
         ];
 
-        let event_type = str_from_json(&json_value, &["type"]);
+        let event_type = str_from_json(&event_json, &["type"]);
         if cli_args.include_requests {
             row.insert(
                 0,
@@ -819,22 +819,22 @@ mod tests {
 
         #[test]
         fn test_format_hmacs_on_string() {
-            let mut json_value = json!("hmac-sha256:1234567890abcdef");
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!("hmac-sha256:1234567890"));
+            let mut event_json = json!("hmac-sha256:1234567890abcdef");
+            format_hmacs(&mut event_json);
+            assert_eq!(event_json, json!("hmac-sha256:1234567890"));
         }
 
         #[test]
         fn test_format_hmacs_on_nested_object() {
-            let mut json_value = json!({
+            let mut event_json = json!({
                 "key": "hmac-sha256:1234567890abcdef",
                 "nested": {
                     "hmac": "hmac-sha256:abcdef1234567890"
                 }
             });
-            format_hmacs(&mut json_value);
+            format_hmacs(&mut event_json);
             assert_eq!(
-                json_value,
+                event_json,
                 json!({
                     "key": "hmac-sha256:1234567890",
                     "nested": {
@@ -846,29 +846,29 @@ mod tests {
 
         #[test]
         fn test_format_hmacs_on_array() {
-            let mut json_value = json!([
+            let mut event_json = json!([
                 "hmac-sha256:abcdef1234567890",
                 "hmac-sha256:9876543210abcdef"
             ]);
-            format_hmacs(&mut json_value);
+            format_hmacs(&mut event_json);
             assert_eq!(
-                json_value,
+                event_json,
                 json!(["hmac-sha256:abcdef1234", "hmac-sha256:9876543210"])
             );
         }
 
         #[test]
         fn test_format_hmacs_no_change_for_non_hmac_string() {
-            let mut json_value = json!("some other string");
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!("some other string"));
+            let mut event_json = json!("some other string");
+            format_hmacs(&mut event_json);
+            assert_eq!(event_json, json!("some other string"));
         }
 
         #[test]
         fn test_format_hmacs_no_change_for_non_string_value() {
-            let mut json_value = json!(123);
-            format_hmacs(&mut json_value);
-            assert_eq!(json_value, json!(123));
+            let mut event_json = json!(123);
+            format_hmacs(&mut event_json);
+            assert_eq!(event_json, json!(123));
         }
     }
 
@@ -879,7 +879,7 @@ mod tests {
         fn when_extra_tokens_present() {
             let hmac_str = format!("{HMAC_PFX_LONG}:123456789");
             let tracked_tok = format!("{hmac_str}a");
-            let json_value = json!({
+            let event_json = json!({
                 "token": tracked_tok,
                 "accessor": format!("{hmac_str}b"),
                 "plaintext": format!("{hmac_str}c"),
@@ -899,7 +899,7 @@ mod tests {
                 expected.insert(hmac_str.to_string());
             });
 
-            let result = track_hmacs(&json_value, &mut tracked_hmacs);
+            let result = track_hmacs(&event_json, &mut tracked_hmacs);
             assert_eq!(tracked_hmacs, expected);
             assert_eq!(result, true);
         }
@@ -910,7 +910,7 @@ mod tests {
             // So the tracked tokens set should not expand.
             let tracked_tok = format!("hmac:abcdef");
             let hmac_str = "hmac:123456789";
-            let json_value = json!({
+            let event_json = json!({
                 "token": format!("{hmac_str}a"),
                 "accessor": format!("{hmac_str}b"),
                 "plaintext": format!("{hmac_str}c"),
@@ -923,7 +923,7 @@ mod tests {
 
             let mut tracked_hmacs: HashSet<String> = HashSet::new();
             tracked_hmacs.insert(tracked_tok.to_string());
-            track_hmacs(&json_value, &mut tracked_hmacs);
+            track_hmacs(&event_json, &mut tracked_hmacs);
 
             // all of the HMACs should be found
             let mut expected: HashSet<String> = HashSet::new();
@@ -932,7 +932,7 @@ mod tests {
                 expected.insert(hmac_str.to_string());
             });
 
-            let result = track_hmacs(&json_value, &mut tracked_hmacs);
+            let result = track_hmacs(&event_json, &mut tracked_hmacs);
             assert_eq!(tracked_hmacs, [tracked_tok].into());
             assert_eq!(result, false);
         }
@@ -943,42 +943,42 @@ mod tests {
 
         #[test]
         fn with_first_level_key() {
-            let json_value = json!({
+            let event_json = json!({
                 "key": "value",
             });
 
-            assert_eq!(str_from_json(&json_value, &["key"]), "value");
+            assert_eq!(str_from_json(&event_json, &["key"]), "value");
         }
 
         #[test]
         fn with_second_level_key() {
-            let json_value = json!({
+            let event_json = json!({
                 "key1": {
                     "key2": "value",
                 }
             });
 
-            assert_eq!(str_from_json(&json_value, &["key1", "key2"]), "value");
+            assert_eq!(str_from_json(&event_json, &["key1", "key2"]), "value");
         }
 
         #[test]
         fn with_missing_first_level_key() {
-            let json_value = json!({
+            let event_json = json!({
                 "key": "value"
             });
 
-            assert_eq!(str_from_json(&json_value, &["wrong"]), "");
+            assert_eq!(str_from_json(&event_json, &["wrong"]), "");
         }
 
         #[test]
         fn with_missing_second_level_key() {
-            let json_value = json!({
+            let event_json = json!({
                 "key1": {
                     "key2": "value",
                 }
             });
 
-            assert_eq!(str_from_json(&json_value, &["key1", "wrong"]), "");
+            assert_eq!(str_from_json(&event_json, &["key1", "wrong"]), "");
         }
     }
 }
