@@ -580,7 +580,14 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         }
 
         let mut headers = vec![
-            "ReqId", "ClientId", "Time", "Src IP", "Actor", "Tokens", "Op", "Path",
+            "ReqId",
+            "ClientId",
+            "Time",
+            "Src IP",
+            "Actor/\nEntity",
+            "Tokens",
+            "Op",
+            "Path",
         ];
         if cli_args.include_requests {
             headers.insert(0, "Type");
@@ -594,7 +601,11 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
             ))),
             Cell::new(&str_from_json(&event_json, &["time"])),
             Cell::new(&str_from_json(&event_json, &["request", "remote_address"])),
-            Cell::new(&actor(&event_json)),
+            Cell::new(format!(
+                "{}/\n{}",
+                actor(&event_json),
+                format_id(&str_from_json(&event_json, &["auth", "entity_id"])),
+            )),
             Cell::new(&tokens(&event_json)),
             Cell::new(&str_from_json(&event_json, &["request", "operation"])),
             Cell::new(&str_from_json(&event_json, &["request", "path"])),
