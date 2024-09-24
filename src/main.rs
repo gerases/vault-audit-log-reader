@@ -77,17 +77,6 @@ struct CliArgs {
     #[arg(long = "summary", action = ArgAction::SetTrue)]
     summary: bool,
 
-    /// HMAC values to track in the log
-    #[arg(
-        short = 't',
-        long = "track",
-        conflicts_with = "summary",
-        value_name = "HMAC",
-        num_args = 1..
-
-    )]
-    track: Option<Vec<String>>,
-
     /// Specify beginning time (e.g. 2024-08-16T18:10:16Z)
     #[arg(short = 's', long = "start-time")]
     start_time: Option<String>,
@@ -441,11 +430,6 @@ fn filter(
     lines: Vec<String>,
     summary: SharedMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
-    let mut tracked_hmacs: HashSet<String> = match &cli_args.track {
-        Some(hmacs) => hmacs.iter().map(|x| x.to_string()).collect(),
-        None => HashSet::new(),
-    };
-
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
@@ -480,9 +464,6 @@ fn filter(
                 if !cli_args.include_requests && err == "" {
                     return false;
                 }
-            }
-            if !tracked_hmacs.is_empty() && !track_hmacs(&event_json, &mut tracked_hmacs) {
-                return false;
             }
             if let Some(path) = &cli_args.path {
                 if !vault_path.starts_with(path) {
@@ -567,6 +548,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 
     output(&cli_args, &queue, &summary);
 
+    println!("done with process");
     Ok(())
 }
 
@@ -696,67 +678,6 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     ok_msg(format!("Found {} events", json_events.len()));
 }
 
-fn track_hmacs(event: &Value, tracked_tokens: &mut HashSet<String>) -> bool {
-    // Given an event (request/response) and a list of tokens to track:
-    //
-    // 1. Get all the HMAC values in the event
-    // 2. If any of tokens in the list of tokens to track (tracked_tokens)
-    //    are present in the list of found HMAC values from step 1, merge
-    //    the two lists and return the new set.
-    let mut hmac_values: HashSet<String> = HashSet::new();
-
-    // Find all hmac values in this event
-    fn find_hmac_values(
-        event: &Value,
-        hmac_values: &mut HashSet<String>,
-        include_keys: &HashSet<&str>,
-    ) {
-        match event {
-            Value::Object(map) => {
-                for (key, val) in map.iter() {
-                    match val {
-                        Value::Object(_) => find_hmac_values(val, hmac_values, include_keys),
-                        Value::String(s) => {
-                            if include_keys.contains(key.as_str()) && s.starts_with(HMAC_PFX_LONG) {
-                                hmac_values.insert(s.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {
-                // do nothing for everything else
-            }
-        }
-    }
-
-    let include_keys: HashSet<&str> = HashSet::from([
-        "token",
-        "accessor",
-        "ciphertext",
-        "plaintext",
-        "client_token",
-        "client_token_accessor",
-    ]);
-    find_hmac_values(event, &mut hmac_values, &include_keys);
-
-    if hmac_values.iter().any(|hmac| {
-        tracked_tokens.iter().any(|token| {
-            // remove the prefix from the tokens before
-            // comparing them
-            let _hmac = hmac.replace(HMAC_PFX_LONG, "");
-            let _token = token.replace(HMAC_PFX_LONG, "");
-            _hmac.starts_with(&_token)
-        })
-    }) {
-        tracked_tokens.extend(hmac_values);
-        return true;
-    }
-
-    return false;
-}
-
 fn main() {
     init_logger();
     let cli_args = CliArgs::parse();
@@ -766,6 +687,7 @@ fn main() {
         Err(err) => err_msg(err.to_string()),
     }
     debug_msg!(format!("The arguments are: {:?}", cli_args));
+    println!("done with main");
 }
 
 // {{{ TESTS
@@ -929,72 +851,6 @@ mod tests {
             let mut event_json = json!(123);
             format_hmacs(&mut event_json);
             assert_eq!(event_json, json!(123));
-        }
-    }
-
-    mod test_track_hmacs {
-        use super::*;
-
-        #[test]
-        fn when_extra_tokens_present() {
-            let hmac_str = format!("{HMAC_PFX_LONG}:123456789");
-            let tracked_tok = format!("{hmac_str}a");
-            let event_json = json!({
-                "token": tracked_tok,
-                "accessor": format!("{hmac_str}b"),
-                "plaintext": format!("{hmac_str}c"),
-                "client_token_accessor": format!("{hmac_str}d"),
-                "key1": {
-                     "ciphertext": format!("{hmac_str}e"),
-                     "client_token": format!("{hmac_str}f")
-                }
-            });
-            let mut tracked_hmacs: HashSet<String> = HashSet::new();
-            tracked_hmacs.insert(tracked_tok.to_string());
-
-            // all of the HMACs should be found
-            let mut expected: HashSet<String> = HashSet::new();
-            ('a'..='f').for_each(|chr| {
-                let hmac_str = format!("{hmac_str}{chr}");
-                expected.insert(hmac_str.to_string());
-            });
-
-            let result = track_hmacs(&event_json, &mut tracked_hmacs);
-            assert_eq!(tracked_hmacs, expected);
-            assert_eq!(result, true);
-        }
-
-        #[test]
-        fn when_nothing_extra_found() {
-            // This token is not related to any of the tokens in the request.
-            // So the tracked tokens set should not expand.
-            let tracked_tok = format!("hmac:abcdef");
-            let hmac_str = "hmac:123456789";
-            let event_json = json!({
-                "token": format!("{hmac_str}a"),
-                "accessor": format!("{hmac_str}b"),
-                "plaintext": format!("{hmac_str}c"),
-                "client_token_accessor": format!("{hmac_str}d"),
-                "key1": {
-                     "ciphertext": format!("{hmac_str}e"),
-                     "client_token": format!("{hmac_str}f")
-                }
-            });
-
-            let mut tracked_hmacs: HashSet<String> = HashSet::new();
-            tracked_hmacs.insert(tracked_tok.to_string());
-            track_hmacs(&event_json, &mut tracked_hmacs);
-
-            // all of the HMACs should be found
-            let mut expected: HashSet<String> = HashSet::new();
-            ('a'..='f').for_each(|chr| {
-                let hmac_str = format!("{hmac_str}{chr}");
-                expected.insert(hmac_str.to_string());
-            });
-
-            let result = track_hmacs(&event_json, &mut tracked_hmacs);
-            assert_eq!(tracked_hmacs, [tracked_tok].into());
-            assert_eq!(result, false);
         }
     }
 
