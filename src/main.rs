@@ -13,13 +13,11 @@ use std::fs::File;
 use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::mpsc;
+use std::sync::{Once};
 use std::thread::JoinHandle;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
-
-type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
-type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
 
 static INIT: Once = Once::new();
 
@@ -428,7 +426,7 @@ fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Resul
 fn filter(
     cli_args: &CliArgs,
     lines: Vec<String>,
-    summary: SharedMap<String, usize>,
+    summary: &mut HashMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
     let result = lines
         .into_iter()
@@ -443,7 +441,6 @@ fn filter(
         })
         .filter(|event_json: &Value| {
             let event_type = str_from_json(&event_json, &["type"]);
-            let mut summary = summary.lock().unwrap();
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json_no_err(&event_json, &["error"]);
 
@@ -515,47 +512,51 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         )
     };
     debug_msg!(format!("Number of threads is {num_threads}"));
+
+    // Use mpsc channel for communication between threads
+    let (tx, rx) = mpsc::channel::<(Vec<Value>, HashMap<String, usize>)>();
+
     let ranges = split_into_ranges(file_size, num_threads);
     let mut handles: Vec<JoinHandle<()>> = vec![];
-    let queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
-    let summary: SharedMap<String, usize> = Arc::new(Mutex::new(HashMap::new()));
+    let summary: HashMap<String, usize> = HashMap::new();
     ranges.into_iter().for_each(|range| {
-        let queue_clone = Arc::clone(&queue);
-        let summary_clone = Arc::clone(&summary);
+        let mut summary = summary.clone();
         let cli_args_clone = cli_args.clone();
+        let tx = tx.clone();
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
                 "Thread={:?}; Processing range {:?}",
                 thread_id, range
             ));
-            let mut queue = queue_clone.lock().unwrap();
             let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
-            let filtered = filter(&cli_args_clone, lines, summary_clone).unwrap();
-            queue.extend(filtered);
+            let filtered = filter(&cli_args_clone, lines, &mut summary).unwrap();
+            tx.send((filtered, summary)).unwrap();
         });
         handles.push(handle);
     });
 
-    let thread_count = handles.len();
-    ok_msg(format!("Threads: {}", thread_count));
-    for handle in handles {
-        handle.join().unwrap_or_else(|error| {
-            err_msg(format!("Error waiting for thread to join: {:?}", error));
-        });
+    drop(tx);
+
+    ok_msg(format!("Threads: {}", handles.len()));
+
+    let mut global_queue = HashSet::new();
+    let mut global_summary = HashMap::<String, usize>::new();
+    for (queue, summary) in rx {
+        global_queue.extend(queue);
+        for (key, val) in summary {
+            *global_summary.entry(key).or_insert(0) += val;
+        }
     }
-    debug_msg!(format!("Count of lines: {}", queue.lock().unwrap().len()));
 
-    output(&cli_args, &queue, &summary);
-
+    debug_msg!(format!("Count of lines: {}", global_queue.len()));
+    output(&cli_args, &global_queue, &global_summary);
     println!("done with process");
     Ok(())
 }
 
-fn show_summary(summary: &SharedMap<String, usize>) {
+fn show_summary(summary: &HashMap<String, usize>) {
     let mut sorted_vec: Vec<(String, usize)> = summary
-        .lock()
-        .unwrap()
         .iter()
         .map(|(k, &v)| (k.clone(), v))
         .collect();
@@ -571,8 +572,8 @@ fn show_summary(summary: &SharedMap<String, usize>) {
     println!("{table}");
 }
 
-fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
-    let json_events = queue.lock().unwrap();
+fn output(cli_args: &CliArgs, queue: &HashSet<Value>, summary: &HashMap<String, usize>) {
+    let json_events = queue;
     if json_events.is_empty() {
         err_msg("Nothing found matching the criteria".to_string());
         return;
