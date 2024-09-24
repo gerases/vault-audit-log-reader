@@ -204,20 +204,30 @@ where
     }
 }
 
-fn actor(auth: &Value) -> String {
-    match auth.get("metadata") {
-        Some(value) => match value.get("role_name") {
-            Some(role_name) => role_name.as_str().unwrap().to_string(),
-            None => str_from_json(&value, &["username"]).to_string(),
+fn actor(json_event: &Value) -> String {
+    match json_event.get("auth") {
+        Some(auth_json) => match auth_json.get("metadata") {
+            Some(value) => match value.get("role_name") {
+                Some(role_name) => role_name.as_str().unwrap().to_string(),
+                None => str_from_json(&value, &["username"]).to_string(),
+            },
+            None => str_from_json(auth_json, &["display_name"]).to_string(),
         },
-        None => str_from_json(auth, &["display_name"]).to_string(),
+        None => {
+            err_msg(format!("Can't get auth section for request_id={}", id(&json_event)).into());
+            "".to_string()
+        }
     }
 }
 
-fn path(request: &Value) -> String {
-    return str_from_json(&request, &["path"])
-        .to_string()
-        .replace("sys/internal/ui/mounts/", "");
+fn id(json_event: &Value) -> String {
+    match json_event.get("id") {
+        Some(id) => return id.to_string(),
+        None => {
+            err_msg(format!("Can't get id out of {:?}", json_event));
+            "".to_string()
+        }
+    }
 }
 
 fn format_id(id: &str) -> String {
@@ -265,11 +275,13 @@ fn col2idx(table: &Table, title: &str) -> usize {
     return 0;
 }
 
+#[allow(dead_code)]
 fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
     let hostname = lookup_addr(&ip)?;
     Ok(hostname)
 }
 
+#[allow(dead_code)]
 fn format_ipv4_addr(remote_addr: &str) -> String {
     if remote_addr == "" {
         return String::from("Remote addr missing");
@@ -560,9 +572,6 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     table.load_preset(UTF8_FULL);
 
     for json_value in sorted_vec {
-        let raw_auth = json_value.get("auth").unwrap();
-        let raw_request = json_value.get("request").unwrap();
-
         let mut stdout = StandardStream::stdout(ColorChoice::Auto);
         if cli_args.raw {
             to_writer(&mut stdout, &json_value).unwrap();
@@ -578,17 +587,17 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         }
         table.set_header(headers);
         let mut row = vec![
-            Cell::new(&format_id(&str_from_json(&raw_request, &["id"]))),
+            Cell::new(&format_id(&str_from_json(&json_value, &["request", "id"]))),
             Cell::new(&format_id(&str_from_json_no_err(
-                &raw_request,
-                &["client_id"],
+                &json_value,
+                &["request", "client_id"],
             ))),
             Cell::new(&str_from_json(&json_value, &["time"])),
-            Cell::new(&str_from_json(&raw_request, &["remote_address"])),
-            Cell::new(&actor(&raw_auth)),
+            Cell::new(&str_from_json(&json_value, &["request", "remote_address"])),
+            Cell::new(&actor(&json_value)),
             Cell::new(&tokens(&json_value)),
-            Cell::new(&str_from_json(&raw_request, &["operation"])),
-            Cell::new(&path(&raw_request)),
+            Cell::new(&str_from_json(&json_value, &["request", "operation"])),
+            Cell::new(&str_from_json(&json_value, &["request", "path"])),
         ];
 
         let event_type = str_from_json(&json_value, &["type"]);
@@ -597,7 +606,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
                 0,
                 Cell::new(match event_type.as_str() {
                     "request" => "req".to_string(),
-                    "response" => "repl".to_string(),
+                    "response" => "rsp".to_string(),
                     &_ => {
                         err_msg("Unexpected type: {}".into());
                         "".to_string()
