@@ -1,6 +1,6 @@
 use chrono::{DateTime, ParseResult, Utc};
 use clap::{ArgAction, Parser};
-use colored::Colorize;
+use colored::{Color, ColoredString, Colorize};
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
 use dns_lookup::lookup_addr;
 use log::LevelFilter;
@@ -14,11 +14,14 @@ use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
+
+type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
+type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
 
 static INIT: Once = Once::new();
 
@@ -28,6 +31,22 @@ const HMAC_LEN: usize = 10;
 const HMAC_PFX: &str = "hmac:";
 const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
+
+// Define a new trait
+pub trait BrownColorize {
+    fn brown(&self) -> ColoredString;
+}
+
+// Implement the BrownColorize trait for the `&str` type
+impl BrownColorize for str {
+    fn brown(&self) -> ColoredString {
+        self.color(Color::TrueColor {
+            r: 194,
+            g: 90,
+            b: 0,
+        })
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Request<'a> {
@@ -66,8 +85,8 @@ struct CliArgs {
     client_id: Option<String>,
 
     /// Limit to a single thread
-    #[arg(short = 'S', long = "single-thread", action = ArgAction::SetTrue)]
-    single_thread: bool,
+    #[arg(short = 'T', long = "threads")]
+    threads: Option<usize>,
 
     /// Include requests too
     #[arg(short = 'R', long = "include-requests", action = ArgAction::SetTrue)]
@@ -136,15 +155,6 @@ fn err_msg_with_exit(msg: String) {
 
 fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
-}
-
-fn print_time_diff(start: Instant, end: Instant) {
-    debug_msg!(format!(
-        "Processing by {:?} finished in {:?}",
-        std::thread::current().id(),
-        end - start
-    )
-    .yellow());
 }
 
 fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -> String {
@@ -403,10 +413,11 @@ fn filter(
     summary: &mut HashMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
     let start = Instant::now();
-    println!(
-        "{}",
-        format!("{:?} is starting...", std::thread::current().id()).yellow()
-    );
+    debug_msg!(format!(
+        "Filtering thread {:?} is starting",
+        std::thread::current().id()
+    )
+    .yellow());
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
@@ -428,10 +439,12 @@ fn filter(
             // request events should be counted. This is to prevent
             // double-counting by looking at both the request and the
             // response.
+            // TODO: TEST!
             let should_update_summary =
                 !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+                return false;
             }
 
             if event_type == "request" {
@@ -476,7 +489,12 @@ fn filter(
         })
         .collect::<Vec<Value>>();
     let end = Instant::now();
-    print_time_diff(start, end);
+    debug_msg!(format!(
+        "Filter thread thread={:?} finished in {:?}",
+        std::thread::current().id(),
+        end - start,
+    )
+    .yellow());
     return Ok(result);
 }
 
@@ -484,8 +502,14 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     let logical_cores = num_cpus::get();
     let metadata = std::fs::metadata(&cli_args.log_file)?;
     let file_size = metadata.len();
-    let num_threads = if cli_args.single_thread {
-        1
+    let num_threads = if let Some(threads) = cli_args.threads {
+        if threads > logical_cores {
+            println!(
+                "Warning: number of threads ({}) exceed logical cores ({}), capping to {}",
+                threads, logical_cores, logical_cores
+            );
+        }
+        std::cmp::min(logical_cores, threads)
     } else {
         std::cmp::min(
             (file_size / MIN_BYTES_PER_THREAD).max(1) as usize,
@@ -506,11 +530,21 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         let tx = tx.clone();
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
+            // TODO: move inside filter
             debug_msg!(format!(
-                "Thread={:?} will be processing a range of {:?} bytes ({}) Mb",
+                "Thread={:?} will process {:?} bytes ({}) {}",
                 thread_id,
                 range,
-                (range.end - range.start) / 1_000_000
+                if range.end - range.start >= 1_000_000 {
+                    (range.end - range.start) as f64 / 1_000_000.0 // in MB
+                } else {
+                    (range.end - range.start) as f64 / 1_000.0 // in KB
+                },
+                if range.end - range.start >= 1_000_000 {
+                    "MB"
+                } else {
+                    "KB"
+                },
             )
             .yellow());
             let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
@@ -524,27 +558,64 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 
     ok_msg(format!("Threads: {}", handles.len()));
 
+    let mut handles: Vec<JoinHandle<()>> = vec![];
+    let global_queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
+    let global_summary: SharedMap<String, usize> = Arc::new(Mutex::new(HashMap::new()));
+
     let start = Instant::now();
-    let mut global_queue = HashSet::new();
-    let mut global_summary = HashMap::<String, usize>::new();
     for (queue, summary) in rx {
-        global_queue.extend(queue);
-        for (key, val) in summary {
-            *global_summary.entry(key).or_insert(0) += val;
-        }
+        let global_queue_clone = Arc::clone(&global_queue);
+        let global_summary_clone = Arc::clone(&global_summary);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            debug_msg!(format!(
+                "Post-processing thread {:?} begins working on {} lines and {} summary entries",
+                std::thread::current().id(),
+                queue.len(),
+                summary.len(),
+            )
+            .brown());
+            global_queue_clone.lock().unwrap().extend(queue);
+            for (key, val) in summary {
+                *global_summary_clone.lock().unwrap().entry(key).or_insert(0) += val;
+            }
+            let end = Instant::now();
+            debug_msg!(format!(
+                "Post-processing thread {:?} finished in {:?}",
+                std::thread::current().id(),
+                end - start,
+            )
+            .brown());
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        debug_msg!(format!("Reaped thread={:?}", handle.thread().id()).cyan());
+        handle.join().unwrap_or_else(|error| {
+            err_msg(format!("Error waiting for thread to join: {:?}", error));
+        });
     }
     let end = Instant::now();
-    print_time_diff(start, end);
+    debug_msg!(format!("All of post-filtering finished in {:?}", end - start).green());
 
-    debug_msg!(format!("Count of lines: {}", global_queue.len()));
+    if !cli_args.summary {
+        debug_msg!(format!(
+            "Count of lines: {}",
+            global_queue.lock().unwrap().len()
+        ))
+    };
     output(&cli_args, &global_queue, &global_summary);
-    println!("done with process");
     Ok(())
 }
 
-fn show_summary(summary: &HashMap<String, usize>) {
-    let mut sorted_vec: Vec<(String, usize)> =
-        summary.iter().map(|(k, &v)| (k.clone(), v)).collect();
+fn show_summary(summary: &SharedMap<String, usize>) {
+    let mut sorted_vec: Vec<(String, usize)> = summary
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, &v)| (k.clone(), v))
+        .collect();
 
     sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -557,15 +628,15 @@ fn show_summary(summary: &HashMap<String, usize>) {
     println!("{table}");
 }
 
-fn output(cli_args: &CliArgs, queue: &HashSet<Value>, summary: &HashMap<String, usize>) {
-    let json_events = queue;
-    if json_events.is_empty() {
-        err_msg("Nothing found matching the criteria".to_string());
+fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
+    if cli_args.summary {
+        show_summary(summary);
         return;
     }
 
-    if cli_args.summary {
-        show_summary(summary);
+    let json_events = queue.lock().unwrap();
+    if json_events.is_empty() {
+        err_msg("Nothing found matching the criteria".to_string());
         return;
     }
 
@@ -667,13 +738,15 @@ fn output(cli_args: &CliArgs, queue: &HashSet<Value>, summary: &HashMap<String, 
 fn main() {
     init_logger();
     let cli_args = CliArgs::parse();
-    // let args: Cli = parse_args();
+    let start = Instant::now();
     match process(&cli_args) {
-        Ok(_) => {}
+        Ok(_) => {
+            let end = Instant::now();
+            debug_msg!(format!("main() finished in {:?}", end - start).green());
+        }
         Err(err) => err_msg(err.to_string()),
     }
     debug_msg!(format!("The arguments are: {:?}", cli_args));
-    println!("done with main");
 }
 
 // {{{ TESTS
