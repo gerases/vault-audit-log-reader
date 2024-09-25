@@ -4,7 +4,7 @@ use colored::Colorize;
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
 use dns_lookup::lookup_addr;
 use log::LevelFilter;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use num_cpus;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,8 +14,9 @@ use std::io::Read;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
-use std::sync::{Once};
+use std::sync::Once;
 use std::thread::JoinHandle;
+use std::time::Instant;
 use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
 
@@ -137,6 +138,15 @@ fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
 }
 
+fn print_time_diff(start: Instant, end: Instant) {
+    debug_msg!(format!(
+        "Processing by {:?} finished in {:?}",
+        std::thread::current().id(),
+        end - start
+    )
+    .yellow());
+}
+
 fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -> String {
     let mut current_val = event_json;
     for key in keys {
@@ -144,7 +154,7 @@ fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -
             Some(json) => json,
             None => {
                 if print_error {
-                    err_msg(format!("Missing key: {key}"));
+                    err_msg(format!("Missing key: {key}, event_json={:?}", event_json));
                 }
                 return String::new();
             }
@@ -318,22 +328,31 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
         let read_size = std::cmp::min(seek_pos as usize, CHUNK_SIZE);
         seek_pos = seek_pos.saturating_sub(read_size as u64);
         if seek_pos == 0 {
-            debug_msg!("Got to the beginning of the file");
+            trace!("Got to the beginning of the file");
             break;
         }
         file.seek(SeekFrom::Start(seek_pos))?;
         file.read_exact(&mut buffer[..read_size])?;
         for i in (0..read_size).rev() {
             if buffer[i] == b'\n' {
-                debug_msg!(format!("Found new line in the buffer at position {i}"));
-                debug_msg!(format!(
-                    "The buffer contains {:?}",
-                    buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
-                ));
-                debug_msg!(format!("Start position is {start_pos}"));
-                debug_msg!(format!("Seek position is {seek_pos}"));
+                trace!(
+                    "{}",
+                    format!("Found new line in the buffer at position {i}")
+                );
+                trace!(
+                    "{}",
+                    format!(
+                        "The buffer contains {:?}",
+                        buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
+                    )
+                );
+                trace!("{}", format!("Start position is {start_pos}"));
+                trace!("{}", format!("Seek position is {seek_pos}"));
                 let line_start = seek_pos + i as u64 + 1;
-                debug_msg!(format!("Line start is {seek_pos} + {i} + 1 = {line_start}"));
+                trace!(
+                    "{}",
+                    format!("Line start is {seek_pos} + {i} + 1 = {line_start}")
+                );
                 return Ok(line_start);
             }
         }
@@ -347,13 +366,13 @@ fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Resul
 
     let line_start = match find_beginning_of_line(&mut file, range.start) {
         Ok(line_start) => {
-            debug_msg!(format!("Line starts at pos {line_start}"));
+            trace!("{}", format!("Line starts at pos {line_start}"));
             line_start
         }
         Err(err) => return Err(err),
     };
 
-    debug_msg!(format!("Reading from pos={line_start}"));
+    trace!("{}", format!("Reading from pos={line_start}"));
     file.seek(SeekFrom::Start(line_start))?;
     let reader = BufReader::new(file);
 
@@ -383,6 +402,11 @@ fn filter(
     lines: Vec<String>,
     summary: &mut HashMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
+    let start = Instant::now();
+    println!(
+        "{}",
+        format!("{:?} is starting...", std::thread::current().id()).yellow()
+    );
     let result = lines
         .into_iter()
         .filter_map(|line| match serde_json::from_str(&line) {
@@ -451,6 +475,8 @@ fn filter(
             return true;
         })
         .collect::<Vec<Value>>();
+    let end = Instant::now();
+    print_time_diff(start, end);
     return Ok(result);
 }
 
@@ -481,9 +507,12 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             debug_msg!(format!(
-                "Thread={:?}; Processing range {:?}",
-                thread_id, range
-            ));
+                "Thread={:?} will be processing a range of {:?} bytes ({}) Mb",
+                thread_id,
+                range,
+                (range.end - range.start) / 1_000_000
+            )
+            .yellow());
             let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
             let filtered = filter(&cli_args_clone, lines, &mut summary).unwrap();
             tx.send((filtered, summary)).unwrap();
@@ -495,6 +524,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 
     ok_msg(format!("Threads: {}", handles.len()));
 
+    let start = Instant::now();
     let mut global_queue = HashSet::new();
     let mut global_summary = HashMap::<String, usize>::new();
     for (queue, summary) in rx {
@@ -503,6 +533,8 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
             *global_summary.entry(key).or_insert(0) += val;
         }
     }
+    let end = Instant::now();
+    print_time_diff(start, end);
 
     debug_msg!(format!("Count of lines: {}", global_queue.len()));
     output(&cli_args, &global_queue, &global_summary);
@@ -511,10 +543,8 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 }
 
 fn show_summary(summary: &HashMap<String, usize>) {
-    let mut sorted_vec: Vec<(String, usize)> = summary
-        .iter()
-        .map(|(k, &v)| (k.clone(), v))
-        .collect();
+    let mut sorted_vec: Vec<(String, usize)> =
+        summary.iter().map(|(k, &v)| (k.clone(), v)).collect();
 
     sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
 
@@ -587,7 +617,7 @@ fn output(cli_args: &CliArgs, queue: &HashSet<Value>, summary: &HashMap<String, 
             Cell::new(format!(
                 "{}/\n{}",
                 actor(&event_json),
-                format_id(&str_from_json(&event_json, &["auth", "entity_id"])),
+                format_id(&str_from_json_no_err(&event_json, &["auth", "entity_id"])),
             )),
             Cell::new(&tokens(&event_json)),
             Cell::new(&str_from_json(&event_json, &["request", "operation"])),
