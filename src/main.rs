@@ -83,7 +83,6 @@ struct CliArgs {
         value_name = "STRING",
         conflicts_with = "summary",
         help = "plain text filter"
-
     )]
     txt_filter: Option<String>,
 
@@ -99,7 +98,7 @@ struct CliArgs {
     )]
     client_id: Option<String>,
 
-    /// Limit to a single thread
+    /// Specify number of workers
     #[arg(short = 'T', long = "threads")]
     threads: Option<usize>,
 
@@ -452,7 +451,7 @@ fn filter(
                 return true;
             }
 
-            return false
+            return false;
         })
         .filter_map(|line| match serde_json::from_str(&line) {
             Ok(json) => Some(json),
@@ -478,6 +477,12 @@ fn filter(
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+            }
+
+            // don't process anything else because only summary will be shown. forgetting this
+            // simple idea was why the performance was bad.
+            if cli_args.summary {
+                return false;
             }
 
             if event_type == "request" {
@@ -842,7 +847,6 @@ mod tests {
 
         let cli = Cli {
             log_file: file.path().to_str().unwrap().to_string(),
-            single_thread: false,
             output_raw: false,
             include_requests: false,
             summary: false,
