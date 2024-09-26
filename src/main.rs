@@ -72,6 +72,21 @@ struct LogEntry<'a> {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
+    /// TODO it seems that summary should be a subcommand
+
+    /// Pre-filter string. If specified, each line will be match against it
+    /// _before_ decoding the JSON and only the lines that match this will
+    /// pass to the next stage in the filtering pipeline.
+    #[arg(
+        short = 'F',
+        long = "filter",
+        value_name = "STRING",
+        conflicts_with = "summary",
+        help = "plain text filter"
+
+    )]
+    txt_filter: Option<String>,
+
     /// Limit to a request with a given id
     #[arg(long = "id", value_name = "Request-Id", help = "filter by request id")]
     id: Option<String>,
@@ -418,8 +433,27 @@ fn filter(
         std::thread::current().id()
     )
     .yellow());
+
+    let txt_filter = match &cli_args.txt_filter {
+        Some(filter) => &filter,
+        None => "",
+    };
+
     let result = lines
         .into_iter()
+        .filter(|line| {
+            // TODO: extract the path via a regex to avoid decoding
+            // We have to parse everything for now
+            if cli_args.summary {
+                return true;
+            }
+
+            if !txt_filter.is_empty() && line.contains(txt_filter) {
+                return true;
+            }
+
+            return false
+        })
         .filter_map(|line| match serde_json::from_str(&line) {
             Ok(json) => Some(json),
             Err(e) => {
@@ -441,10 +475,9 @@ fn filter(
             // response.
             // TODO: TEST!
             let should_update_summary =
-                !cli_args.include_requests || event_type.as_str() == "request";
+                cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
-                return false;
             }
 
             if event_type == "request" {
