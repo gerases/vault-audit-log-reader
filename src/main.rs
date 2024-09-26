@@ -478,26 +478,26 @@ fn filter(
     )
     .yellow());
 
-    let txt_filter = match &cli_args.txt_filter {
-        Some(filter) => &filter,
-        None => "",
-    };
+    // let txt_filter = match &cli_args.txt_filter {
+    //     Some(filter) => &filter,
+    //     None => "",
+    // };
 
     let result = lines
         .into_iter()
-        .filter(|line| {
-            // TODO: extract the path via a regex to avoid decoding
-            // We have to parse everything for now
-            if cli_args.summary {
-                return true;
-            }
+        // .filter(|line| {
+        //     // TODO: extract the path via a regex to avoid decoding
+        //     // We have to parse everything for now
+        //     if cli_args.summary {
+        //         return true;
+        //     }
 
-            if !txt_filter.is_empty() && line.contains(txt_filter) {
-                return true;
-            }
+        //     if !txt_filter.is_empty() && line.contains(txt_filter) {
+        //         return true;
+        //     }
 
-            return false;
-        })
+        //     return false;
+        // })
         .filter_map(|line| match serde_json::from_str(&line) {
             Ok(json) => Some(json),
             Err(e) => {
@@ -522,12 +522,6 @@ fn filter(
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
-            }
-
-            // don't process anything else because only summary will be shown. forgetting this
-            // simple idea was why the performance was bad.
-            if cli_args.summary {
-                return false;
             }
 
             if event_type == "request" {
@@ -567,6 +561,11 @@ fn filter(
                 if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
+            }
+            // Don't process anything else because only the summary will be shown. Forgetting this
+            // simple idea was why the performance was so myseriously bad.
+            if cli_args.summary {
+                return false;
             }
             return true;
         })
@@ -705,10 +704,14 @@ fn show_summary(summary: &SharedMap<String, usize>) {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_header(vec!["Path", "NumReq"]);
+
+    // let num_records = sorted_vec.len();
+    // let earliest = str_from_json_no_err(sorted_vec.first(), &["time"]);
     for (path, count) in sorted_vec.into_iter().take(10) {
         table.add_row(vec![Cell::new(path), Cell::new(count)]);
     }
     println!("{table}");
+    // println!("Num records processed: {:?}", sorted_vec.len())
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
