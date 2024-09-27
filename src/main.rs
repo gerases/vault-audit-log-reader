@@ -33,17 +33,26 @@ const CHUNK_SIZE: usize = 8;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 // Define a new trait
-pub trait BrownColorize {
+pub trait CustomColors {
     fn brown(&self) -> ColoredString;
+    fn grey(&self) -> ColoredString;
 }
 
 // Implement the BrownColorize trait for the `&str` type
-impl BrownColorize for str {
+impl CustomColors for str {
     fn brown(&self) -> ColoredString {
         self.color(Color::TrueColor {
             r: 194,
             g: 90,
             b: 0,
+        })
+    }
+
+    fn grey(&self) -> ColoredString {
+        self.color(Color::TrueColor {
+            r: 104,
+            g: 104,
+            b: 104,
         })
     }
 }
@@ -512,18 +521,6 @@ fn filter(
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json_no_err(&event_json, &["error"]);
 
-            // The summary should capture all of the events before any
-            // filtering. If requests are included, then only the path in the
-            // request events should be counted. This is to prevent
-            // double-counting by looking at both the request and the
-            // response.
-            // TODO: TEST!
-            let should_update_summary =
-                cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
-            if should_update_summary {
-                *summary.entry(vault_path.to_string()).or_insert(0) += 1;
-            }
-
             if event_type == "request" {
                 // if an error exists in a request,
                 // show it even if it was not requested
@@ -561,6 +558,17 @@ fn filter(
                 if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
+            }
+            // The summary should capture all of the events before any
+            // filtering. If requests are included, then only the path in the
+            // request events should be counted. This is to prevent
+            // double-counting by looking at both the request and the
+            // response.
+            // TODO: TEST!
+            let should_update_summary =
+                cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
+            if should_update_summary {
+                *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             }
             // Don't process anything else because only the summary will be shown. Forgetting this
             // simple idea was why the performance was so myseriously bad.
@@ -832,7 +840,7 @@ fn main() {
         }
         Err(err) => err_msg(err.to_string()),
     }
-    debug_msg!(format!("The arguments are: {:?}", cli_args));
+    debug_msg!(format!("The arguments are: {:?}", cli_args).grey());
 }
 
 // {{{ TESTS
