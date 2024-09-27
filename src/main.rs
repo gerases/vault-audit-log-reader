@@ -442,26 +442,8 @@ fn filter(
     )
     .yellow());
 
-    // let txt_filter = match &cli_args.txt_filter {
-    //     Some(filter) => &filter,
-    //     None => "",
-    // };
-
     let result = lines
         .into_iter()
-        // .filter(|line| {
-        //     // TODO: extract the path via a regex to avoid decoding
-        //     // We have to parse everything for now
-        //     if cli_args.summary {
-        //         return true;
-        //     }
-
-        //     if !txt_filter.is_empty() && line.contains(txt_filter) {
-        //         return true;
-        //     }
-
-        //     return false;
-        // })
         .filter_map(|line| match serde_json::from_str(&line) {
             Ok(json) => Some(json),
             Err(e) => {
@@ -897,64 +879,6 @@ mod tests {
         assert_eq!(split_into_ranges(0, 1), vec![]);
         assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
         assert_eq!(split_into_ranges(1, 3), vec![0..1]);
-    }
-
-    mod test_format_hmacs {
-        use super::*;
-
-        #[test]
-        fn test_format_hmacs_on_string() {
-            let mut event_json = json!("hmac-sha256:1234567890abcdef");
-            format_hmacs(&mut event_json);
-            assert_eq!(event_json, json!("hmac-sha256:1234567890"));
-        }
-
-        #[test]
-        fn test_format_hmacs_on_nested_object() {
-            let mut event_json = json!({
-                "key": "hmac-sha256:1234567890abcdef",
-                "nested": {
-                    "hmac": "hmac-sha256:abcdef1234567890"
-                }
-            });
-            format_hmacs(&mut event_json);
-            assert_eq!(
-                event_json,
-                json!({
-                    "key": "hmac-sha256:1234567890",
-                    "nested": {
-                        "hmac": "hmac-sha256:abcdef1234"
-                    }
-                })
-            );
-        }
-
-        #[test]
-        fn test_format_hmacs_on_array() {
-            let mut event_json = json!([
-                "hmac-sha256:abcdef1234567890",
-                "hmac-sha256:9876543210abcdef"
-            ]);
-            format_hmacs(&mut event_json);
-            assert_eq!(
-                event_json,
-                json!(["hmac-sha256:abcdef1234", "hmac-sha256:9876543210"])
-            );
-        }
-
-        #[test]
-        fn test_format_hmacs_no_change_for_non_hmac_string() {
-            let mut event_json = json!("some other string");
-            format_hmacs(&mut event_json);
-            assert_eq!(event_json, json!("some other string"));
-        }
-
-        #[test]
-        fn test_format_hmacs_no_change_for_non_string_value() {
-            let mut event_json = json!(123);
-            format_hmacs(&mut event_json);
-            assert_eq!(event_json, json!(123));
-        }
     }
 
     mod test_get_str_from_json {
