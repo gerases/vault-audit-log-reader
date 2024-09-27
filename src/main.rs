@@ -25,6 +25,7 @@ type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
 
 static INIT: Once = Once::new();
 
+const MAX_SUMMARY_LINES: usize = 10;
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
@@ -81,18 +82,6 @@ struct LogEntry<'a> {
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
     /// TODO it seems that summary should be a subcommand
-
-    /// Pre-filter string. If specified, each line will be match against it
-    /// _before_ decoding the JSON and only the lines that match this will
-    /// pass to the next stage in the filtering pipeline.
-    #[arg(
-        short = 'F',
-        long = "filter",
-        value_name = "STRING",
-        conflicts_with = "summary",
-        help = "plain text filter"
-    )]
-    txt_filter: Option<String>,
 
     /// Limit to a request with a given id
     #[arg(long = "id", value_name = "Request-Id", help = "filter by request id")]
@@ -234,7 +223,7 @@ where
         match parse_timestamp(&time_str) {
             Ok(time) => checker(&time),
             Err(_) => {
-                err_msg(format!("Can't parse {time_str}"));
+                err_msg(format!("Can't parse '{time_str}' as time"));
                 false
             }
         }
@@ -370,7 +359,10 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
         let read_size = std::cmp::min(seek_pos as usize, CHUNK_SIZE);
         seek_pos = seek_pos.saturating_sub(read_size as u64);
         if seek_pos == 0 {
-            trace!("Got to the beginning of the file");
+            trace!(
+                "{:?}: got to the beginning of the file",
+                std::thread::current().id()
+            );
             break;
         }
         file.seek(SeekFrom::Start(seek_pos))?;
@@ -378,22 +370,20 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
         for i in (0..read_size).rev() {
             if buffer[i] == b'\n' {
                 trace!(
-                    "{}",
-                    format!("Found new line in the buffer at position {i}")
+                    "{:?}: found new line in the buffer at position {i}",
+                    std::thread::current().id()
                 );
                 trace!(
-                    "{}",
-                    format!(
-                        "The buffer contains {:?}",
-                        buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
-                    )
+                    "{:?}: the buffer contains {:?}",
+                    std::thread::current().id(),
+                    buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
                 );
-                trace!("{}", format!("Start position is {start_pos}"));
-                trace!("{}", format!("Seek position is {seek_pos}"));
+                trace!("{:?}: start position is {start_pos}", std::thread::current().id());
+                trace!("{:?}: seek position is {seek_pos}", std::thread::current().id());
                 let line_start = seek_pos + i as u64 + 1;
                 trace!(
-                    "{}",
-                    format!("Line start is {seek_pos} + {i} + 1 = {line_start}")
+                    "{:?}: line start is {seek_pos} + {i} + 1 = {line_start}",
+                    std::thread::current().id(),
                 );
                 return Ok(line_start);
             }
@@ -477,7 +467,7 @@ fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Resul
 
 fn filter(
     cli_args: &CliArgs,
-    lines: Vec<String>,
+    lines: &Vec<String>,
     summary: &mut HashMap<String, usize>,
 ) -> std::io::Result<Vec<Value>> {
     let start = Instant::now();
@@ -502,6 +492,12 @@ fn filter(
             let event_type = str_from_json(&event_json, &["type"]);
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json_no_err(&event_json, &["error"]);
+
+            // println!(
+            //     "Processing with {:?}, {:?}",
+            //     str_from_json_no_err(&event_json, &["request", "id"]),
+            //     vault_path.to_string()
+            // );
 
             if event_type == "request" {
                 // if an error exists in a request,
@@ -550,6 +546,11 @@ fn filter(
             let should_update_summary =
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
+                // println!(
+                //     "UPdating with {:?}, {:?}",
+                //     str_from_json_no_err(&event_json, &["request", "id"]),
+                //     vault_path.to_string()
+                // );
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             }
             // Don't process anything else because only the summary will be shown. Forgetting this
@@ -600,9 +601,10 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         let mut summary = summary.clone();
         let cli_args_clone = cli_args.clone();
         let tx = tx.clone();
+        // TODO: The ranges need to be found serially to avoid overlap.
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
-            // TODO: move inside filter
+            // TODO: move inside filter potentially
             debug_msg!(format!(
                 "Thread={:?} will process {:?} bytes ({}) {}",
                 thread_id,
@@ -620,7 +622,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
             )
             .yellow());
             let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
-            let filtered = filter(&cli_args_clone, lines, &mut summary).unwrap();
+            let filtered = filter(&cli_args_clone, &lines, &mut summary).unwrap();
             tx.send((filtered, summary)).unwrap();
         });
         handles.push(handle);
@@ -697,11 +699,17 @@ fn show_summary(summary: &SharedMap<String, usize>) {
 
     // let num_records = sorted_vec.len();
     // let earliest = str_from_json_no_err(sorted_vec.first(), &["time"]);
-    for (path, count) in sorted_vec.into_iter().take(10) {
-        table.add_row(vec![Cell::new(path), Cell::new(count)]);
+
+    let mut total_events: usize = 0;
+    for (index, (path, count)) in sorted_vec.into_iter().enumerate() {
+        if index <= MAX_SUMMARY_LINES {
+            table.add_row(vec![Cell::new(path), Cell::new(count)]);
+        }
+        total_events += count;
     }
+
     println!("{table}");
-    // println!("Num records processed: {:?}", sorted_vec.len())
+    println!("Num records processed: {:?}", total_events)
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
@@ -866,8 +874,8 @@ mod tests {
         Ok(())
     }
 
-    fn assert_filter_lines(file_path: &str, range: std::ops::Range<u64>, expected: &[&str]) {
-        let result = filter_lines(file_path, range);
+    fn assert_read_lines(cli: &CliArgs, range: std::ops::Range<u64>, expected: &[&str]) {
+        let result = read_lines(cli, range);
         match result {
             Ok(lines) => assert_eq!(lines, expected),
             Err(e) => panic!("Test failed with error: {:?}", e),
@@ -883,15 +891,17 @@ mod tests {
         let contents = "First line\nSecond line\nThird line\n";
         write!(file, "{contents}")?;
 
-        let cli = Cli {
+        let cli = CliArgs {
+            id: None,
+            client_id: None,
+            threads: None,
             log_file: file.path().to_str().unwrap().to_string(),
-            output_raw: false,
+            raw: false,
             include_requests: false,
             summary: false,
             path: None,
             start_time: String::from("").into(),
             end_time: String::from("").into(),
-            track: None,
         };
 
         // Test case 1: start at byte 0 and request 1 byte. Should still give
@@ -971,6 +981,164 @@ mod tests {
             });
 
             assert_eq!(str_from_json(&event_json, &["key1", "wrong"]), "");
+        }
+    }
+    mod test_filter {
+        use super::*;
+
+        fn response() -> Value {
+            let mut response = request();
+            let response_data = json!({
+                "response": {
+                    "status": "success",
+                    "data": {
+                        "message": "Operation completed"
+                    }
+                }
+            });
+
+            // Check if `json_value` is an object and add the new data
+            if let Some(obj) = response.as_object_mut() {
+                obj.extend(response_data.as_object().unwrap().clone());
+                obj.insert("type".to_string(), Value::String("response".to_string()));
+            }
+
+            return response;
+        }
+
+        fn request() -> Value {
+            let event_json = json!({
+                "time": "2024-08-15T03:07:05.192602684Z",
+                "type": "request",
+                "auth": {
+                    "client_token": "hmac-sha256:client-token",
+                    "accessor": "hmac-sha256:accessor",
+                    "display_name": "display-name",
+                    "entity_id": "entity-id"
+                },
+                "request": {
+                    "id": "id",
+                    "client_id": "client-id",
+                    "operation": "read",
+                    "client_token": "client-token",
+                    "client_token_accessor": "client-token-accessor",
+                    "path": "some-path",
+                    "remote_address": "1.1.1.1"
+                }
+            });
+
+            return event_json;
+        }
+
+        fn get_default_args() -> CliArgs {
+            CliArgs {
+                id: None,
+                client_id: None,
+                threads: None,
+                // don't need it for this test
+                log_file: "not a file".to_string(),
+                raw: false,
+                include_requests: false,
+                summary: false,
+                path: None,
+                start_time: None,
+                end_time: None,
+            }
+        }
+
+        #[test]
+        fn test_default_when_request() {
+            init_logger();
+            let cli = get_default_args();
+            let request = request();
+            let mut summary: HashMap<String, usize> = HashMap::new();
+            let lines: Vec<String> = vec![request.to_string()];
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            assert_eq!(filtered, Vec::<Value>::new());
+        }
+
+        #[test]
+        fn test_default_when_response() {
+            init_logger();
+            let cli = get_default_args();
+            let response = response();
+            let lines: Vec<String> = vec![response.to_string()];
+
+            let mut summary: HashMap<String, usize> = HashMap::new();
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            let mut sum_expected = HashMap::new();
+            sum_expected.insert("some-path".to_string(), 1);
+
+            assert_eq!(filtered, vec![response]);
+            // assert_eq!(summary, sum_expected);
+        }
+
+        #[test]
+        fn test_with_requests_included() {
+            init_logger();
+            let mut cli = get_default_args();
+            cli.include_requests = true;
+            let request = request();
+            let lines: Vec<String> = vec![request.to_string()];
+
+            let mut summary: HashMap<String, usize> = HashMap::new();
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            let mut sum_expected = HashMap::new();
+            sum_expected.insert("some-path".to_string(), 1);
+
+            assert_eq!(filtered, vec![request]);
+            assert_eq!(summary, sum_expected);
+        }
+
+        #[test]
+        fn test_with_1_req_and_two_responses() {
+            init_logger();
+
+            // Test that when requests are present, only their paths are counted
+            let mut cli = get_default_args();
+            cli.include_requests = true;
+
+            let request = request();
+            let response_1 = response();
+            let response_2 = response();
+
+            let lines: Vec<String> = vec![
+                request.to_string(),
+                response_1.to_string(),
+                response_2.to_string(),
+            ];
+            let mut summary: HashMap<String, usize> = HashMap::new();
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            let mut sum_expected = HashMap::new();
+            sum_expected.insert("some-path".to_string(), 1);
+
+            assert_eq!(filtered, vec![request, response_1, response_2]);
+            assert_eq!(summary, sum_expected);
+        }
+
+        #[test]
+        fn test_with_two_responses() {
+            init_logger();
+            // Test that when only responses are present, all of them
+            // contribute to the by-path count.
+            let cli = get_default_args();
+            let request = request();
+            let response_1 = response();
+            let response_2 = response();
+
+            let lines: Vec<String> = vec![
+                request.to_string(), // this should be filtered out because
+                // include_requests is absent
+                response_1.to_string(),
+                response_2.to_string(),
+            ];
+            let mut summary: HashMap<String, usize> = HashMap::new();
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            let mut sum_expected = HashMap::new();
+            sum_expected.insert("some-path".to_string(), 2);
+
+            assert_eq!(filtered, vec![response_1, response_2]);
+            assert_eq!(summary, sum_expected);
         }
     }
 }
