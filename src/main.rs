@@ -6,11 +6,9 @@ use dns_lookup::lookup_addr;
 use log::LevelFilter;
 use log::{debug, error, info, trace};
 use num_cpus;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
@@ -24,13 +22,11 @@ type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
 type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
 
 static INIT: Once = Once::new();
-
 const MAX_SUMMARY_LINES: usize = 10;
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
 const HMAC_PFX_LONG: &str = "hmac-sha256:";
-const CHUNK_SIZE: usize = 512;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 // Define a new trait
@@ -56,27 +52,6 @@ impl CustomColors for str {
             b: 104,
         })
     }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Request<'a> {
-    time: &'a str,
-    id: &'a str,
-    path: &'a str,
-    actor: &'a str,
-    operation: &'a str,
-    clnt_tok: &'a str,
-    accsr_tok: &'a str,
-    tok_issue: &'a str,
-    tok_type: &'a str,
-    remote_address: &'a str,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct LogEntry<'a> {
-    event_type: &'a str,
-    response: Value,
-    request: Request<'a>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -141,11 +116,16 @@ macro_rules! debug_msg {
     }};
 }
 
-pub fn init_logger() {
+pub fn init_logger(level: Option<&str>) {
     INIT.call_once(|| {
         let mut builder = env_logger::Builder::new();
-        // Set the default log level to `Info`
-        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+            match level {
+                Some(level) => level.to_string(),
+                // Set the default log level to `Info`
+                None => "info".to_string(),
+            }
+        });
         builder.filter(None, log_level.parse().unwrap_or(LevelFilter::Info));
         // Initialize the logger
         builder.init();
@@ -317,42 +297,50 @@ fn format_ipv4_addr(remote_addr: &str) -> String {
     };
 }
 
-fn split_into_ranges(
-    filename: &str,
-    num_ranges: usize,
-) -> io::Result<Vec<std::ops::Range<u64>>> {
+fn split_into_ranges(filename: &str, num_ranges: usize) -> io::Result<Vec<std::ops::Range<u64>>> {
     let file = File::open(filename)?;
     let mut reader = BufReader::new(file);
 
     let file_size = reader.seek(SeekFrom::End(0))?;
-    if file_size == 0 {
+    if file_size == 0 || num_ranges == 0 {
         return Ok(Vec::new()); // No ranges requested
     }
 
+    // Go to the beginning of the file
     reader.seek(SeekFrom::Start(0))?;
 
     let chunk_size: u64 = file_size / num_ranges as u64;
     let mut cur_start = 0;
     let mut ranges = Vec::new();
 
-    // let mut buffer: u8 = Vec::new();
     trace!(
-        "{:?}: Trying to split {file_size} bytes into {num_ranges} with a chunk size of {chunk_size}",
+        "{:?}: Splitting {file_size} bytes into {num_ranges} ranges of {chunk_size} bytes",
         std::thread::current().id(),
     );
     for _ in 0..num_ranges {
         let mut cur_end = cur_start + chunk_size;
+        if cur_start >= file_size {
+            trace!(
+                "{:?}: start={cur_start} >= last_byte ({}), end={cur_end}",
+                std::thread::current().id(),
+                file_size - 1,
+            );
+            return Ok(ranges);
+        }
         if cur_end >= file_size {
             trace!(
-                "{:?}: start >= file_size ({cur_start} >= {file_size})",
-                std::thread::current().id()
+                "{:?}: start={cur_start}, end={cur_end} >= last_byte ({})",
+                std::thread::current().id(),
+                file_size - 1,
             );
-            ranges.push(cur_start..cur_end);
+            ranges.push(cur_start..file_size);
             return Ok(ranges);
         }
 
         // Seek to the approximate end and find the next new line char
         reader.seek(SeekFrom::Start(cur_end))?;
+
+        // Read until next new line
         let mut buffer = Vec::new();
         let bytes_read = reader.read_until(b'\n', &mut buffer)?;
         if bytes_read == 0 {
@@ -360,83 +348,37 @@ fn split_into_ranges(
             ranges.push(cur_start..file_size);
             break;
         }
+        trace!(
+            "{:?}: read {bytes_read} bytes, the buffer contains {:?}",
+            std::thread::current().id(),
+            buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
+        );
 
-        cur_end += bytes_read as u64;
+        // It's -1 because if for example we started reading on byte 4 and read 2 bytes, our
+        // position should be 5: byte 4 + byte 5. If we just add 4 and 2 it's 6, which is wrong.
+        cur_end += (bytes_read - 1) as u64;
         trace!(
             "{:?}: range: start={cur_start}, end={cur_end}",
             std::thread::current().id(),
         );
         ranges.push(cur_start..cur_end);
+
         cur_start = cur_end + 1;
     }
 
     Ok(ranges)
 }
 
-fn find_start_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
-    let mut buffer = [0; CHUNK_SIZE];
-    let mut seek_pos = start_pos;
+fn read_range(log_file: &str, range: std::ops::Range<u64>) -> std::io::Result<Vec<String>> {
+    let mut file = File::open(log_file)?;
 
-    loop {
-        let read_size = std::cmp::min(seek_pos as usize, CHUNK_SIZE);
-        seek_pos = seek_pos.saturating_sub(read_size as u64);
-        if seek_pos == 0 {
-            trace!(
-                "{:?}: got to the beginning of the file",
-                std::thread::current().id()
-            );
-            break;
-        }
-        file.seek(SeekFrom::Start(seek_pos))?;
-        file.read_exact(&mut buffer[..read_size])?;
-        for i in (0..read_size).rev() {
-            if buffer[i] == b'\n' {
-                trace!(
-                    "{:?}: found new line in the buffer at position {i}",
-                    std::thread::current().id()
-                );
-                trace!(
-                    "{:?}: the buffer contains {:?}",
-                    std::thread::current().id(),
-                    buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
-                );
-                trace!(
-                    "{:?}: start position is {start_pos}",
-                    std::thread::current().id()
-                );
-                trace!(
-                    "{:?}: seek position is {seek_pos}",
-                    std::thread::current().id()
-                );
-                let line_start = seek_pos + i as u64 + 1;
-                trace!(
-                    "{:?}: line start is {seek_pos} + {i} + 1 = {line_start}",
-                    std::thread::current().id(),
-                );
-                return Ok(line_start);
-            }
-        }
-    }
-
-    return Ok(seek_pos);
-}
-
-fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Result<Vec<String>> {
-    let mut file = File::open(&cli_args.log_file)?;
-
-    let line_start = match find_start_of_line(&mut file, range.start) {
-        Ok(line_start) => {
-            trace!("{}", format!("Line starts at pos {line_start}"));
-            line_start
-        }
-        Err(err) => return Err(err),
-    };
+    let line_start = range.start;
 
     trace!("{}", format!("Reading from pos={line_start}"));
     file.seek(SeekFrom::Start(line_start))?;
     let reader = BufReader::new(file);
 
-    let byte_limit: u64 = range.count().try_into().unwrap();
+    let byte_limit: u64 = (range.count() as u64) + 1;
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
     let lines: Vec<String> = reader
@@ -585,9 +527,13 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 
     // Use mpsc channel for communication between threads
     let (tx, rx) = mpsc::channel::<(Vec<Value>, HashMap<String, usize>)>();
-
-    // let ranges = split_into_ranges(file_size, num_threads);
+    let start = Instant::now();
     let ranges = split_into_ranges(cli_args.log_file.as_str(), num_threads).unwrap();
+    let end = Instant::now();
+    debug_msg!(format!(
+        "Range processing finished in {:?}",
+        end - start,
+    ));
     let mut handles: Vec<JoinHandle<()>> = vec![];
     let summary: HashMap<String, usize> = HashMap::new();
     ranges.into_iter().for_each(|range| {
@@ -614,7 +560,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
                 },
             )
             .yellow());
-            let lines = read_lines(&cli_args_clone, range.clone()).unwrap();
+            let lines = read_range(&cli_args_clone.log_file, range.clone()).unwrap();
             let filtered = filter(&cli_args_clone, &lines, &mut summary).unwrap();
             tx.send((filtered, summary)).unwrap();
         });
@@ -813,7 +759,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
 }
 
 fn main() {
-    init_logger();
+    init_logger(Some("info"));
     let cli_args = CliArgs::parse();
     let start = Instant::now();
     match process(&cli_args) {
@@ -834,75 +780,49 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use tempfile::{tempfile, NamedTempFile};
 
-    fn assert_read_lines(cli: &CliArgs, range: std::ops::Range<u64>, expected: &[&str]) {
-        let result = read_lines(cli, range);
-        match result {
-            Ok(lines) => assert_eq!(lines, expected),
-            Err(e) => panic!("Test failed with error: {:?}", e),
-        }
-    }
-
     #[test]
-    fn test_read_some_lines() -> std::io::Result<()> {
+    fn test_read_range() -> std::io::Result<()> {
+        init_logger(None);
+
         // Create a temporary file with known content
-        init_logger();
-
         let mut file = NamedTempFile::new()?;
-        let contents = "First line\nSecond line\nThird line\n";
+        let contents = "First1line\nSecond2line\nThird3line\n";
         write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
 
-        let cli = CliArgs {
-            id: None,
-            client_id: None,
-            threads: None,
-            log_file: file.path().to_str().unwrap().to_string(),
-            raw: false,
-            include_requests: false,
-            summary: false,
-            path: None,
-            start_time: String::from("").into(),
-            end_time: String::from("").into(),
-        };
-
-        // Test case 1: start at byte 0 and request 1 byte. Should still give
-        // us the whole of the first line.
-        assert_read_lines(&cli, 0..1, &["First line"]);
-
-        // Test case 3: start at byte 0 and request 11 bytes (up to and
-        // including the \n of the first line). Should still give us the whole
-        // of the first line.
-        assert_read_lines(&cli, 0..11, &["First line"]);
-
-        // // Test case 3: start at byte 0 and request 12 bytes (first byte of
-        // // line 2). Should still give us lin1 and line 2.
-        assert_read_lines(&cli, 0..12, &["First line", "Second line"]);
-
-        // // Test case 4: start at byte 30 (end of line 3) and request 100 bytes
-        // // (well past the end of line 3). Should still give us all of line 3.
-        assert_read_lines(&cli, 30..130, &["Third line"]);
+        // Start at byte 0 and request 2 bytes. Should return the whole
+        // first line.
+        assert_eq!(read_range(filename, 0..1).unwrap(), &["First1line"]);
+        // bytes representing all of First1line
+        assert_eq!(read_range(filename, 0..10).unwrap(), &["First1line"]);
+        // Start at byte 10 (eol of line 1) and request 2 bytes. Should return the whole
+        // second line. The empty string is because the first position was
+        // a newline.
+        assert_eq!(read_range(filename, 10..11).unwrap(), &["", "Second2line"]);
+        assert_eq!(
+            read_range(filename, 0..1000).unwrap(),
+            &["First1line", "Second2line", "Third3line"]
+        );
 
         Ok(())
     }
 
     #[test]
     fn test_split_into_ranges() -> std::io::Result<()> {
-        init_logger();
+        init_logger(Some("trace"));
         let mut file = NamedTempFile::new()?;
-        let contents = "First line\nSecond line\nThird line\n";
+        let contents = "First1line\nSecond2line\nThird3line\n";
         write!(file, "{contents}")?;
         let path = file.path().to_str().unwrap();
 
-        // assert_eq!(split_into_ranges_new(path, 0).unwrap(), vec![]);
-        // assert_eq!(split_into_ranges_new(path, 1).unwrap(), vec![0..34]);
-        // assert_eq!(
-        //     split_into_ranges_new(path, 2).unwrap(),
-        //     vec![0..22, 23..34]
-        // );
-        assert_eq!(split_into_ranges_new(path, 3).unwrap(), vec![0..22, 23..34]);
-        // assert_eq!(
-        //     split_into_ranges_new(path, 10).unwrap(),
-        //     vec![0..10, 11..22, 23..33]
-        // );
+        assert_eq!(split_into_ranges(path, 0).unwrap(), vec![]);
+        assert_eq!(split_into_ranges(path, 1).unwrap(), vec![0..34]);
+        assert_eq!(split_into_ranges(path, 2).unwrap(), vec![0..22, 23..34]);
+        assert_eq!(split_into_ranges(path, 3).unwrap(), vec![0..22, 23..34]);
+        assert_eq!(
+            split_into_ranges(path, 10).unwrap(),
+            vec![0..10, 11..22, 23..33]
+        );
 
         Ok(())
     }
@@ -1015,7 +935,7 @@ mod tests {
 
         #[test]
         fn test_default_when_request() {
-            init_logger();
+            init_logger(None);
             let cli = get_default_args();
             let request = request();
             let mut summary: HashMap<String, usize> = HashMap::new();
@@ -1026,7 +946,7 @@ mod tests {
 
         #[test]
         fn test_default_when_response() {
-            init_logger();
+            init_logger(None);
             let cli = get_default_args();
             let response = response();
             let lines: Vec<String> = vec![response.to_string()];
@@ -1042,7 +962,7 @@ mod tests {
 
         #[test]
         fn test_with_requests_included() {
-            init_logger();
+            init_logger(None);
             let mut cli = get_default_args();
             cli.include_requests = true;
             let request = request();
@@ -1059,7 +979,7 @@ mod tests {
 
         #[test]
         fn test_with_1_req_and_two_responses() {
-            init_logger();
+            init_logger(None);
 
             // Test that when requests are present, only their paths are counted
             let mut cli = get_default_args();
@@ -1085,7 +1005,7 @@ mod tests {
 
         #[test]
         fn test_with_two_responses() {
-            init_logger();
+            init_logger(None);
             // Test that when only responses are present, all of them
             // contribute to the by-path count.
             let cli = get_default_args();
