@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
@@ -29,8 +29,8 @@ const MAX_SUMMARY_LINES: usize = 10;
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
-const HMAC_PFX: &str = "hmac:";
-const CHUNK_SIZE: usize = 8;
+const HMAC_PFX_LONG: &str = "hmac-sha256:";
+const CHUNK_SIZE: usize = 512;
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 // Define a new trait
@@ -317,6 +317,62 @@ fn format_ipv4_addr(remote_addr: &str) -> String {
     };
 }
 
+fn split_into_ranges_new(
+    filename: &str,
+    num_ranges: usize,
+) -> io::Result<Vec<std::ops::Range<u64>>> {
+    let file = File::open(filename)?;
+    let mut reader = BufReader::new(file);
+
+    let file_size = reader.seek(SeekFrom::End(0))?;
+    if file_size == 0 {
+        return Ok(Vec::new()); // No ranges requested
+    }
+
+    reader.seek(SeekFrom::Start(0))?;
+
+    let chunk_size: u64 = file_size / num_ranges as u64;
+    let mut cur_start = 0;
+    let mut ranges = Vec::new();
+
+    // let mut buffer: u8 = Vec::new();
+    trace!(
+        "{:?}: Trying to split {file_size} bytes into {num_ranges} with a chunk size of {chunk_size}",
+        std::thread::current().id(),
+    );
+    for _ in 0..num_ranges {
+        let mut cur_end = cur_start + chunk_size;
+        if cur_end >= file_size {
+            trace!(
+                "{:?}: start >= file_size ({cur_start} >= {file_size})",
+                std::thread::current().id()
+            );
+            ranges.push(cur_start..cur_end);
+            return Ok(ranges);
+        }
+
+        // Seek to the approximate end and find the next new line char
+        reader.seek(SeekFrom::Start(cur_end))?;
+        let mut buffer = Vec::new();
+        let bytes_read = reader.read_until(b'\n', &mut buffer)?;
+        if bytes_read == 0 {
+            // No newline found, just go from current_start to the end of the file
+            ranges.push(cur_start..file_size);
+            break;
+        }
+
+        cur_end += bytes_read as u64;
+        trace!(
+            "{:?}: range: start={cur_start}, end={cur_end}",
+            std::thread::current().id(),
+        );
+        ranges.push(cur_start..cur_end);
+        cur_start = cur_end + 1;
+    }
+
+    Ok(ranges)
+}
+
 fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u64>> {
     if num_bytes == 0 || num_ranges == 0 {
         return Vec::new(); // No ranges requested
@@ -342,7 +398,37 @@ fn split_into_ranges(num_bytes: u64, num_ranges: usize) -> Vec<std::ops::Range<u
         .collect()
 }
 
-fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
+fn find_end_of_line(file: &mut File, start_pos: u64) -> io::Result<u64> {
+    let mut buffer = [0; CHUNK_SIZE];
+    file.seek(SeekFrom::Start(start_pos))?;
+    let mut cur_pos = start_pos;
+
+    loop {
+        let bytes_read = match file.read(&mut buffer) {
+            Ok(0) => {
+                return file.stream_position();
+            }
+            Ok(bytes_read) => bytes_read,
+            Err(e) => return Err(e),
+        };
+
+        trace!("{:?}: cur_pos = {cur_pos}", std::thread::current().id());
+        for i in 0..bytes_read {
+            if buffer[i] == b'\n' {
+                trace!(
+                    "{:?}: found new line in the buffer at position {i}. Returning {cur_pos} + {i}",
+                    std::thread::current().id()
+                );
+                return Ok(cur_pos + i as u64);
+            }
+        }
+
+        // increment the position and read again
+        cur_pos += bytes_read as u64
+    }
+}
+
+fn find_start_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u64> {
     let mut buffer = [0; CHUNK_SIZE];
     let mut seek_pos = start_pos;
 
@@ -369,8 +455,14 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
                     std::thread::current().id(),
                     buffer.into_iter().map(|n| n as char).collect::<Vec<_>>()
                 );
-                trace!("{:?}: start position is {start_pos}", std::thread::current().id());
-                trace!("{:?}: seek position is {seek_pos}", std::thread::current().id());
+                trace!(
+                    "{:?}: start position is {start_pos}",
+                    std::thread::current().id()
+                );
+                trace!(
+                    "{:?}: seek position is {seek_pos}",
+                    std::thread::current().id()
+                );
                 let line_start = seek_pos + i as u64 + 1;
                 trace!(
                     "{:?}: line start is {seek_pos} + {i} + 1 = {line_start}",
@@ -387,7 +479,7 @@ fn find_beginning_of_line(file: &mut File, start_pos: u64) -> std::io::Result<u6
 fn read_lines(cli_args: &CliArgs, range: std::ops::Range<u64>) -> std::io::Result<Vec<String>> {
     let mut file = File::open(&cli_args.log_file)?;
 
-    let line_start = match find_beginning_of_line(&mut file, range.start) {
+    let line_start = match find_start_of_line(&mut file, range.start) {
         Ok(line_start) => {
             trace!("{}", format!("Line starts at pos {line_start}"));
             line_start
@@ -549,7 +641,8 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     // Use mpsc channel for communication between threads
     let (tx, rx) = mpsc::channel::<(Vec<Value>, HashMap<String, usize>)>();
 
-    let ranges = split_into_ranges(file_size, num_threads);
+    // let ranges = split_into_ranges(file_size, num_threads);
+    let ranges = split_into_ranges_new(cli_args.log_file.as_str(), num_threads).unwrap();
     let mut handles: Vec<JoinHandle<()>> = vec![];
     let summary: HashMap<String, usize> = HashMap::new();
     ranges.into_iter().for_each(|range| {
@@ -664,7 +757,7 @@ fn show_summary(summary: &SharedMap<String, usize>) {
     }
 
     println!("{table}");
-    println!("Num records processed: {:?}", total_events)
+    println!("Number of filtered records: {:?}", total_events)
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
@@ -797,6 +890,44 @@ mod tests {
     use tempfile::{tempfile, NamedTempFile};
 
     #[test]
+    fn test_find_end_of_line() -> std::io::Result<()> {
+        // uncomment to enable logging in testing
+        init_logger();
+
+        // Create a temporary file with known content
+        let mut file = tempfile()?;
+        let contents = "First line\nSecond line\nThird line\n";
+        write!(file, "{contents}")?;
+
+        // Test case 1: Start from the very beginning
+        file.seek(SeekFrom::Start(0))?;
+        let end_pos = find_end_of_line(&mut file, 0)?;
+        assert_eq!(end_pos, 10);
+
+        // Test case 2: Start from the middle of "Second line"
+        file.seek(SeekFrom::Start(15))?;
+        let start_pos = find_end_of_line(&mut file, 15)?;
+        assert_eq!(start_pos, 22);
+
+        // Test case 3: Start from the middle of "Third line"
+        file.seek(SeekFrom::Start(28))?;
+        let start_pos = find_end_of_line(&mut file, 28)?;
+        assert_eq!(start_pos, 33);
+
+        // Test case 4: Start from the end of "Third line"
+        let end_pos = file.seek(SeekFrom::End(-1))?;
+        let start_pos = find_end_of_line(&mut file, end_pos)?;
+        assert_eq!(start_pos, 33);
+
+        // Test case 5: Start from a new line
+        file.seek(SeekFrom::Start(10))?;
+        let end_pos = find_end_of_line(&mut file, 10)?;
+        assert_eq!(end_pos, 10);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_find_beginning_of_line() -> std::io::Result<()> {
         // uncomment to enable logging in testing
         // init_logger();
@@ -808,22 +939,22 @@ mod tests {
 
         // Test case 1: Start from the very beginning
         file.seek(SeekFrom::Start(0))?;
-        let start_pos = find_beginning_of_line(&mut file, 0)?;
+        let start_pos = find_start_of_line(&mut file, 0)?;
         assert_eq!(start_pos, 0);
 
         // Test case 2: Start from the middle of "Second line"
         file.seek(SeekFrom::Start(15))?;
-        let start_pos = find_beginning_of_line(&mut file, 15)?;
+        let start_pos = find_start_of_line(&mut file, 15)?;
         assert_eq!(start_pos, 11);
 
         // Test case 3: Start from the middle of "Third line"
         file.seek(SeekFrom::Start(28))?;
-        let start_pos = find_beginning_of_line(&mut file, 28)?;
+        let start_pos = find_start_of_line(&mut file, 28)?;
         assert_eq!(start_pos, 23);
 
         // Test case 4: Start from the end of "Third line"
         let end_pos = file.seek(SeekFrom::End(-1))?;
-        let start_pos = find_beginning_of_line(&mut file, end_pos)?;
+        let start_pos = find_start_of_line(&mut file, end_pos)?;
         assert_eq!(start_pos, 23);
 
         Ok(())
@@ -881,7 +1012,6 @@ mod tests {
 
     #[test]
     fn test_split_into_ranges() {
-        // Create a temporary file with known content
         init_logger();
 
         assert_eq!(split_into_ranges(0, 0), vec![]);
@@ -889,6 +1019,29 @@ mod tests {
         assert_eq!(split_into_ranges(0, 1), vec![]);
         assert_eq!(split_into_ranges(100, 3), vec![0..34, 34..67, 67..100]);
         assert_eq!(split_into_ranges(1, 3), vec![0..1]);
+    }
+
+    #[test]
+    fn test_split_into_ranges_new() -> std::io::Result<()> {
+        init_logger();
+        let mut file = NamedTempFile::new()?;
+        let contents = "First line\nSecond line\nThird line\n";
+        write!(file, "{contents}")?;
+        let path = file.path().to_str().unwrap();
+
+        // assert_eq!(split_into_ranges_new(path, 0).unwrap(), vec![]);
+        // assert_eq!(split_into_ranges_new(path, 1).unwrap(), vec![0..34]);
+        // assert_eq!(
+        //     split_into_ranges_new(path, 2).unwrap(),
+        //     vec![0..22, 23..34]
+        // );
+        assert_eq!(split_into_ranges_new(path, 3).unwrap(), vec![0..22, 23..34]);
+        // assert_eq!(
+        //     split_into_ranges_new(path, 10).unwrap(),
+        //     vec![0..10, 11..22, 23..33]
+        // );
+
+        Ok(())
     }
 
     mod test_get_str_from_json {
