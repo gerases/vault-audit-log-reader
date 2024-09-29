@@ -1,0 +1,21 @@
+#[test]
+fn test_get_last_line() -> std::io::Result<()> {
+    init_logger(Some("trace"));
+    let mut file = NamedTempFile::new()?;
+
+    let contents = "First line\nSecond line\nThird line\n";
+    write!(file, "{contents}")?;
+    file.seek(SeekFrom::Start(0))?;
+
+    let filename = file.path().to_str().unwrap();
+    assert_eq!(get_last_line(filename).unwrap(), "Third line\n".to_string());
+
+    let contents = "First line\n";
+    write!(file, "{contents}")?;
+
+    let filename = file.path().to_str().unwrap();
+    file.seek(SeekFrom::Start(0))?;
+    assert_eq!(get_last_line(filename).unwrap(), "First line\n".to_string());
+
+    Ok(())
+}
