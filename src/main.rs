@@ -78,6 +78,10 @@ struct CliArgs {
     #[arg(short = 'R', long = "include-requests", action = ArgAction::SetTrue)]
     include_requests: bool,
 
+    /// Show the date of the first and last log entries
+    #[arg(long = "dates", action = ArgAction::SetTrue)]
+    dates: bool,
+
     /// Show only the summary
     #[arg(long = "summary", action = ArgAction::SetTrue)]
     summary: bool,
@@ -738,6 +742,83 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
 }
 
 fn get_last_line(filename: &str) -> std::io::Result<String> {
+    const BUFSIZE: usize = 512;
+    let file = File::open(filename)?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0; BUFSIZE];
+
+    let file_size = reader.seek(SeekFrom::End(0))?;
+    if file_size == 0 {
+        return Ok("".to_string());
+    }
+
+    let mut seek_pos = reader.seek(SeekFrom::End(-1))?;
+    trace!("Initial seek_pos={seek_pos}");
+    'outer: loop {
+        let read_size = std::cmp::min(seek_pos, BUFSIZE as u64);
+        trace!("buf size = {}", read_size);
+        seek_pos = seek_pos.saturating_sub(read_size);
+        if seek_pos == 0 {
+            trace!("Got to the beginning of the file");
+        };
+        reader.seek(SeekFrom::Start(seek_pos))?;
+        trace!("Current seek position={}", seek_pos);
+        reader.read_exact(&mut buf[..read_size as usize])?;
+        // Let's say we're at the end of the file:
+        //
+        // Let's say the buf contains: line1\nline2\nline3\n
+        //
+        // If we now search for a new line iteration in the buffer starting
+        // from 0, we'll find the newline after line1. But what we need is
+        // the one after line2 (first new line to left of line3).
+        //
+        // So we need to iterate from read_size to 0 (or right to left).
+        // This is what .rev() does. And when we iteratate that way, we'll
+        // first get to the \n after line2.
+        for i in (0..read_size).rev() {
+            trace!("i={}", i);
+            if i == 0 {
+                trace!(
+                    "Nothing found in seek_pos={} through 0",
+                    reader.stream_position()?
+                );
+                break;
+            }
+            // if the next byte to the left is '\n', break.
+            if buf[(i as usize) - 1] == b'\n' {
+                trace!(
+                    "The buffer contains: {:?}",
+                    buf.iter()
+                        .take(read_size as usize)
+                        .map(|c| *c as char)
+                        .collect::<String>()
+                );
+                trace!(
+                    "Found new line at seek_pos={}+{}={}",
+                    seek_pos,
+                    i,
+                    seek_pos + i
+                );
+                reader.seek(SeekFrom::Start(seek_pos + i))?;
+                break 'outer;
+            }
+        }
+
+        if seek_pos == 0 {
+            trace!("No new line found");
+            reader.seek(SeekFrom::Start(0))?;
+            break;
+        }
+    }
+
+    let mut line = String::new();
+    trace!("Reading line at seek_pos={}...", reader.stream_position()?,);
+    reader.read_line(&mut line)?;
+    trace!("... line='{}'", line,);
+    Ok(line)
+}
+
+fn get_last_line_old(filename: &str) -> std::io::Result<String> {
     let file = File::open(filename)?;
     let mut reader = BufReader::new(file);
     let mut buf = [0; 1];
@@ -769,10 +850,45 @@ fn get_last_line(filename: &str) -> std::io::Result<String> {
     Ok(line)
 }
 
+fn parse_json_line(line: &str) -> std::io::Result<Value> {
+    match serde_json::from_str(line) {
+        Ok(json) => Ok(json),
+        Err(e) => {
+            err_msg(format!(
+                "Failed to convert the following line to JSON: '{line}': {e}"
+            ));
+            Err(io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+    }
+}
+
+fn show_date_range(filename: &str) -> std::io::Result<()> {
+    // Output the time of the first and last records
+    let file = File::open(filename)?;
+    let mut reader = BufReader::new(file);
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let first_line_json = parse_json_line(&line).unwrap();
+
+    let last_line = get_last_line(&filename).unwrap();
+    let last_line_json = parse_json_line(&last_line).unwrap();
+
+    println!("Earliest record: {}", str_from_json(&first_line_json, &["time"]));
+    println!("Latest record:   {}", str_from_json(&last_line_json, &["time"]));
+
+    Ok(())
+}
+
 fn main() {
     init_logger(Some("info"));
     let cli_args = CliArgs::parse();
     let start = Instant::now();
+    if cli_args.dates {
+        show_date_range(&cli_args.log_file).unwrap();
+        return;
+    }
+
     match process(&cli_args) {
         Ok(_) => {
             let end = Instant::now();
@@ -788,8 +904,8 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::{Write};
-    use tempfile::{NamedTempFile};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_get_last_line() -> std::io::Result<()> {
