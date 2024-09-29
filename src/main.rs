@@ -9,6 +9,7 @@ use num_cpus;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Read;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
@@ -57,8 +58,6 @@ impl CustomColors for str {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "Read vault audit log", version = "1.0")]
 struct CliArgs {
-    /// TODO it seems that summary should be a subcommand
-
     /// Limit to a request with a given id
     #[arg(long = "id", value_name = "Request-Id", help = "filter by request id")]
     id: Option<String>,
@@ -473,12 +472,6 @@ fn filter(
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json_no_err(&event_json, &["error"]);
 
-            // println!(
-            //     "Processing with {:?}, {:?}",
-            //     str_from_json_no_err(&event_json, &["request", "id"]),
-            //     vault_path.to_string()
-            // );
-
             if event_type == "request" {
                 // if an error exists in a request,
                 // show it even if it was not requested
@@ -517,20 +510,10 @@ fn filter(
                     return false;
                 }
             }
-            // The summary should capture all of the events before any
-            // filtering. If requests are included, then only the path in the
-            // request events should be counted. This is to prevent
-            // double-counting by looking at both the request and the
-            // response.
             // TODO: TEST!
             let should_update_summary =
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
-                // println!(
-                //     "UPdating with {:?}, {:?}",
-                //     str_from_json_no_err(&event_json, &["request", "id"]),
-                //     vault_path.to_string()
-                // );
                 *summary.entry(vault_path.to_string()).or_insert(0) += 1;
             }
             // Don't process anything else because only the summary will be shown. Forgetting this
@@ -576,17 +559,13 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     let start = Instant::now();
     let ranges = split_into_ranges(cli_args.log_file.as_str(), num_threads).unwrap();
     let end = Instant::now();
-    debug_msg!(format!(
-        "Range processing finished in {:?}",
-        end - start,
-    ));
+    debug_msg!(format!("Range processing finished in {:?}", end - start,));
     let mut handles: Vec<JoinHandle<()>> = vec![];
     let summary: HashMap<String, usize> = HashMap::new();
     ranges.into_iter().for_each(|range| {
         let mut summary = summary.clone();
         let cli_args_clone = cli_args.clone();
         let tx = tx.clone();
-        // TODO: The ranges need to be found serially to avoid overlap.
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
             // TODO: move inside filter potentially
@@ -804,6 +783,38 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
     ok_msg(format!("Found {} events", json_events.len()));
 }
 
+fn get_last_line(filename: &str) -> std::io::Result<String> {
+    let file = File::open(filename)?;
+    let mut reader = BufReader::new(file);
+    let mut buf = [0; 1];
+
+    let file_size = reader.seek(SeekFrom::End(0))?;
+    if file_size == 0 {
+        return Ok("".to_string());
+    }
+    let mut cur_pos = reader.seek(SeekFrom::End(-1))?;
+    loop {
+        trace!("cur_pos={cur_pos}");
+        cur_pos = cur_pos.saturating_sub(1);
+        if cur_pos == 0 {
+            trace!("Got to the beginning of the file");
+            reader.seek(SeekFrom::Start(0))?;
+            break;
+        };
+        reader.seek(SeekFrom::Start(cur_pos))?;
+        reader.read_exact(&mut buf)?;
+        if buf[0] == b'\n' {
+            break;
+        }
+    }
+
+    let cur_pos = reader.stream_position()?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    trace!("Reading line at cur_pos={cur_pos}; line='{line}'");
+    Ok(line)
+}
+
 fn main() {
     init_logger(Some("info"));
     let cli_args = CliArgs::parse();
@@ -823,8 +834,45 @@ fn main() {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::{Seek, SeekFrom, Write};
-    use tempfile::{tempfile, NamedTempFile};
+    use std::io::{Write};
+    use tempfile::{NamedTempFile};
+
+    #[test]
+    fn test_get_last_line() -> std::io::Result<()> {
+        init_logger(Some("trace"));
+
+        let mut file = NamedTempFile::new()?;
+        let contents = "First line\nSecond line\nThird line\n";
+        write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
+        assert_eq!(get_last_line(filename).unwrap(), "Third line\n".to_string());
+
+        let mut file = NamedTempFile::new()?;
+        let contents = "First line";
+        write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
+        assert_eq!(get_last_line(filename).unwrap(), "First line".to_string());
+
+        let mut file = NamedTempFile::new()?;
+        let contents = "F";
+        write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
+        assert_eq!(get_last_line(filename).unwrap(), "F".to_string());
+
+        let mut file = NamedTempFile::new()?;
+        let contents = "";
+        write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
+        assert_eq!(get_last_line(filename).unwrap(), "".to_string());
+
+        let mut file = NamedTempFile::new()?;
+        let contents = "\n".to_string();
+        write!(file, "{contents}")?;
+        let filename = file.path().to_str().unwrap();
+        assert_eq!(get_last_line(filename).unwrap(), "\n".to_string());
+
+        Ok(())
+    }
 
     #[test]
     fn test_read_range() -> std::io::Result<()> {
