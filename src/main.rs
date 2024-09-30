@@ -21,7 +21,7 @@ use termcolor::{ColorChoice, StandardStream};
 use termcolor_json::to_writer;
 
 type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
-type SharedMap<T1, T2> = Arc<Mutex<HashMap<T1, T2>>>;
+type SharedSummary = Arc<Mutex<Summary>>;
 
 static INIT: Once = Once::new();
 const MAX_SUMMARY_LINES: usize = 10;
@@ -131,6 +131,21 @@ struct CliArgs {
     /// Log file
     #[arg(short = 'f', long = "file", value_name = "LOG_FILE", required = true)]
     log_file: String,
+}
+
+#[derive(Debug, Clone)]
+struct Summary {
+    by_path: HashMap<String, usize>,
+    total_events: usize,
+}
+
+impl Summary {
+    fn new() -> Self {
+        Summary {
+            by_path: HashMap::new(),
+            total_events: 0,
+        }
+    }
 }
 
 macro_rules! debug_msg {
@@ -472,7 +487,7 @@ fn read_range(log_file: &str, range: std::ops::Range<u64>) -> std::io::Result<Ve
 fn filter(
     cli_args: &CliArgs,
     lines: &Vec<String>,
-    summary: &mut HashMap<String, usize>,
+    summary: &mut Summary,
 ) -> std::io::Result<Vec<Value>> {
     let start = Instant::now();
     debug_msg!(format!(
@@ -481,15 +496,19 @@ fn filter(
     )
     .yellow());
 
+    let mut count: usize = 0;
     let result = lines
         .into_iter()
-        .filter_map(|line| match serde_json::from_str(&line) {
-            Ok(json) => Some(json),
-            Err(e) => {
-                err_msg(format!(
-                    "Failed to convert the following line to JSON: '{line}': {e}"
-                ));
-                None
+        .filter_map(|line| {
+            count += 1;
+            match serde_json::from_str(&line) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    err_msg(format!(
+                        "Failed to convert the following line to JSON: '{line}': {e}"
+                    ));
+                    None
+                }
             }
         })
         .filter(|event_json: &Value| {
@@ -545,7 +564,7 @@ fn filter(
             let should_update_summary =
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
-                *summary.entry(vault_path.to_string()).or_insert(0) += 1;
+                *summary.by_path.entry(vault_path.to_string()).or_insert(0) += 1;
             }
             // Don't process anything else because only the summary will be shown. Forgetting this
             // simple idea was why the performance was so myseriously bad.
@@ -555,6 +574,9 @@ fn filter(
             return true;
         })
         .collect::<Vec<Value>>();
+
+    summary.total_events = count;
+
     let end = Instant::now();
     debug_msg!(format!(
         "Filter thread thread={:?} finished in {:?}",
@@ -586,13 +608,13 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     debug_msg!(format!("Number of threads is {num_threads}"));
 
     // Use mpsc channel for communication between threads
-    let (tx, rx) = mpsc::channel::<(Vec<Value>, HashMap<String, usize>)>();
+    let (tx, rx) = mpsc::channel::<(Vec<Value>, Summary)>();
     let start = Instant::now();
     let ranges = split_into_ranges(cli_args.log_file.as_str(), num_threads).unwrap();
     let end = Instant::now();
     debug_msg!(format!("Range processing finished in {:?}", end - start,));
     let mut handles: Vec<JoinHandle<()>> = vec![];
-    let summary: HashMap<String, usize> = HashMap::new();
+    let summary: Summary = Summary::new();
     ranges.into_iter().for_each(|range| {
         let mut summary = summary.clone();
         let cli_args_clone = cli_args.clone();
@@ -629,7 +651,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
 
     let mut handles: Vec<JoinHandle<()>> = vec![];
     let global_queue: SharedQueue<Value> = Arc::new(Mutex::new(HashSet::new()));
-    let global_summary: SharedMap<String, usize> = Arc::new(Mutex::new(HashMap::new()));
+    let global_summary: SharedSummary = Arc::new(Mutex::new(Summary::new()));
 
     let start = Instant::now();
     for (queue, summary) in rx {
@@ -641,13 +663,20 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
                 "Post-processing thread {:?} begins working on {} lines and {} summary entries",
                 std::thread::current().id(),
                 queue.len(),
-                summary.len(),
+                summary.by_path.len(),
             )
             .brown());
             global_queue_clone.lock().unwrap().extend(queue);
-            for (key, val) in summary {
-                *global_summary_clone.lock().unwrap().entry(key).or_insert(0) += val;
+            for (key, val) in summary.by_path {
+                *global_summary_clone
+                    .lock()
+                    .unwrap()
+                    .by_path
+                    .entry(key)
+                    .or_insert(0) += val;
             }
+            global_summary_clone.lock().unwrap().total_events += summary.total_events;
+
             let end = Instant::now();
             debug_msg!(format!(
                 "Post-processing thread {:?} finished in {:?}",
@@ -678,10 +707,11 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     Ok(())
 }
 
-fn show_summary(summary: &SharedMap<String, usize>) {
+fn show_summary(summary: &SharedSummary) {
     let mut sorted_vec: Vec<(String, usize)> = summary
         .lock()
         .unwrap()
+        .by_path
         .iter()
         .map(|(k, &v)| (k.clone(), v))
         .collect();
@@ -704,10 +734,17 @@ fn show_summary(summary: &SharedMap<String, usize>) {
     }
 
     println!("{table}");
-    ok_msg(format!("Number of filtered records: {}", total_events.fmt()))
+    ok_msg(format!(
+        "Number of un-filtered records: {}",
+        summary.lock().unwrap().total_events.fmt()
+    ));
+    ok_msg(format!(
+        "Number of filtered records: {}",
+        total_events.fmt()
+    ))
 }
 
-fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
+fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummary) {
     if cli_args.summary {
         show_summary(summary);
         return;
@@ -811,10 +848,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         println!("{table}");
     }
 
-    ok_msg(format!(
-        "Found {} events",
-        json_events.len().fmt()
-    ));
+    ok_msg(format!("Found {} events", json_events.len().fmt()));
 }
 
 fn get_last_line(filename: &str) -> std::io::Result<String> {
