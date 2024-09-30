@@ -76,6 +76,15 @@ struct CliArgs {
 
     /// Limit to requests with a given client id
     #[arg(
+        long = "actor",
+        value_name = "user_id",
+        conflicts_with = "summary",
+        help = "id of the actor (e.g. username or role name)"
+    )]
+    actor: Option<String>,
+
+    /// Limit to requests with a given client id
+    #[arg(
         long = "client-id",
         value_name = "Client-Id",
         help = "filter by client id"
@@ -477,6 +486,12 @@ fn filter(
             if let Some(cli_client_id) = &cli_args.client_id {
                 let client_id = str_from_json_no_err(&event_json, &["request", "client_id"]);
                 if !client_id.starts_with(&*cli_client_id) {
+                    return false;
+                }
+            }
+            if let Some(cli_actor) = &cli_args.actor {
+                let actor = str_from_json_no_err(&event_json, &["actor"]);
+                if !actor.starts_with(&*cli_actor) {
                     return false;
                 }
             }
