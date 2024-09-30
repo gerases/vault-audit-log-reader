@@ -32,6 +32,17 @@ const HMAC_PFX_LONG: &str = "hmac-sha256:";
 const MIN_BYTES_PER_THREAD: u64 = 2_000;
 
 // Define a new trait
+pub trait NumFormat {
+    fn fmt(&self) -> String;
+}
+
+impl NumFormat for usize {
+    fn fmt(&self) -> String {
+        self.to_formatted_string(&Locale::en)
+    }
+}
+
+// Define a new trait for custom colorization
 pub trait CustomColors {
     fn brown(&self) -> ColoredString;
     fn grey(&self) -> ColoredString;
@@ -599,7 +610,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     if !cli_args.summary {
         debug_msg!(format!(
             "Count of lines: {}",
-            global_queue.lock().unwrap().len()
+            global_queue.lock().unwrap().len().fmt()
         ))
     };
     output(&cli_args, &global_queue, &global_summary);
@@ -632,7 +643,7 @@ fn show_summary(summary: &SharedMap<String, usize>) {
     }
 
     println!("{table}");
-    println!("Number of filtered records: {:?}", total_events)
+    ok_msg(format!("Number of filtered records: {}", total_events.fmt()))
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<String, usize>) {
@@ -741,7 +752,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
 
     ok_msg(format!(
         "Found {} events",
-        json_events.len().to_formatted_string(&Locale::en)
+        json_events.len().fmt()
     ));
 }
 
