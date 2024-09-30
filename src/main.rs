@@ -864,38 +864,6 @@ fn get_last_line(filename: &str) -> std::io::Result<String> {
     Ok(line)
 }
 
-fn get_last_line_old(filename: &str) -> std::io::Result<String> {
-    let file = File::open(filename)?;
-    let mut reader = BufReader::new(file);
-    let mut buf = [0; 1];
-
-    let file_size = reader.seek(SeekFrom::End(0))?;
-    if file_size == 0 {
-        return Ok("".to_string());
-    }
-    let mut cur_pos = reader.seek(SeekFrom::End(-1))?;
-    loop {
-        trace!("cur_pos={cur_pos}");
-        cur_pos = cur_pos.saturating_sub(1);
-        if cur_pos == 0 {
-            trace!("Got to the beginning of the file");
-            reader.seek(SeekFrom::Start(0))?;
-            break;
-        };
-        reader.seek(SeekFrom::Start(cur_pos))?;
-        reader.read_exact(&mut buf)?;
-        if buf[0] == b'\n' {
-            break;
-        }
-    }
-
-    let cur_pos = reader.stream_position()?;
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    trace!("Reading line at cur_pos={cur_pos}; line='{line}'");
-    Ok(line)
-}
-
 fn parse_json_line(line: &str) -> std::io::Result<Value> {
     match serde_json::from_str(line) {
         Ok(json) => Ok(json),
