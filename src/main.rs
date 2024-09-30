@@ -459,7 +459,7 @@ fn filter(
                 }
             }
             if let Some(path) = &cli_args.path {
-                if !vault_path.starts_with(path) {
+                if !vault_path.contains(path) {
                     return false;
                 }
             }
