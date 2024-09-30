@@ -6,6 +6,7 @@ use dns_lookup::lookup_addr;
 use log::LevelFilter;
 use log::{debug, error, info, trace};
 use num_cpus;
+use num_format::{Locale, ToFormattedString};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -784,7 +785,10 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedMap<St
         println!("{table}");
     }
 
-    ok_msg(format!("Found {} events", json_events.len()));
+    ok_msg(format!(
+        "Found {} events",
+        json_events.len().to_formatted_string(&Locale::en)
+    ));
 }
 
 fn get_last_line(filename: &str) -> std::io::Result<String> {
@@ -888,8 +892,14 @@ fn show_date_range(filename: &str) -> std::io::Result<()> {
     let last_line = get_last_line(&filename).unwrap();
     let last_line_json = parse_json_line(&last_line).unwrap();
 
-    println!("Earliest record: {}", str_from_json(&first_line_json, &["time"]));
-    println!("Latest record:   {}", str_from_json(&last_line_json, &["time"]));
+    println!(
+        "Earliest record: {}",
+        str_from_json(&first_line_json, &["time"])
+    );
+    println!(
+        "Latest record:   {}",
+        str_from_json(&last_line_json, &["time"])
+    );
 
     Ok(())
 }
