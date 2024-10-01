@@ -135,14 +135,14 @@ struct CliArgs {
 
 #[derive(Debug, Clone)]
 struct Summary {
-    by_path: HashMap<String, usize>,
+    count_by_path: HashMap<String, usize>,
     total_events: usize,
 }
 
 impl Summary {
     fn new() -> Self {
         Summary {
-            by_path: HashMap::new(),
+            count_by_path: HashMap::new(),
             total_events: 0,
         }
     }
@@ -518,7 +518,10 @@ fn filter(
             let should_update_summary =
                 cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
             if should_update_summary {
-                *summary.by_path.entry(vault_path.to_string()).or_insert(0) += 1;
+                *summary
+                    .count_by_path
+                    .entry(vault_path.to_string())
+                    .or_insert(0) += 1;
             }
             // Don't process anything else because only the summary will be shown. Forgetting this
             // simple idea was why the performance was so myseriously bad.
@@ -617,15 +620,15 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
                 "Post-processing thread {:?} begins working on {} lines and {} summary entries",
                 std::thread::current().id(),
                 queue.len(),
-                summary.by_path.len(),
+                summary.count_by_path.len(),
             )
             .brown());
             global_queue_clone.lock().unwrap().extend(queue);
-            for (key, val) in summary.by_path {
+            for (key, val) in summary.count_by_path {
                 *global_summary_clone
                     .lock()
                     .unwrap()
-                    .by_path
+                    .count_by_path
                     .entry(key)
                     .or_insert(0) += val;
             }
@@ -665,7 +668,7 @@ fn show_summary(summary: &SharedSummary) {
     let mut sorted_vec: Vec<(String, usize)> = summary
         .lock()
         .unwrap()
-        .by_path
+        .count_by_path
         .iter()
         .map(|(k, &v)| (k.clone(), v))
         .collect();
