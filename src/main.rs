@@ -157,16 +157,6 @@ macro_rules! debug_msg {
 
 pub fn init_logger(level: Option<&str>) {
     INIT.call_once(|| {
-        env_logger::init();
-    });
-}
-
-fn ok_msg(msg: String) {
-    info!("{}", msg.green());
-}
-
-pub fn init_logger() {
-    INIT.call_once(|| {
         let mut builder = env_logger::Builder::new();
         let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| {
             match level {
@@ -430,7 +420,7 @@ fn read_range(log_file: &str, range: std::ops::Range<u64>) -> std::io::Result<Ve
     let byte_limit: u64 = (range.count() as u64) + 1;
     let mut num_bytes_read: u64 = 0;
     // Collect N lines from the current position
-    let lines: Vec<Value> = reader
+    let lines: Vec<String> = reader
         .lines()
         .take_while(|line| {
             if let Ok(ref line) = line {
@@ -443,43 +433,7 @@ fn read_range(log_file: &str, range: std::ops::Range<u64>) -> std::io::Result<Ve
                 false
             }
         })
-        .filter_map(|line| {
-            match line {
-                Ok(line) => match serde_json::from_str(&line) {
-                    Ok(json) => Some(json),
-                    Err(e) => {
-                        eprintln!("Failed to parse JSON: {}", e); // Log or handle the error
-                        None
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Failed to read line: {}", e); // Log or handle the error
-                    None
-                }
-            }
-        })
-        .filter(|json_value: &Value| {
-            let event_type = json_value.get("type").unwrap();
-            if cli_args.responses_only && event_type != "response" {
-                return false;
-            }
-
-            let mut stdout = StandardStream::stdout(ColorChoice::Auto);
-
-            if cli_args.output_raw {
-                to_writer(&mut stdout, &json_value).unwrap();
-                return false;
-            }
-
-            let raw_auth = json_value.get("auth");
-            let raw_request = json_value.get("request");
-            let raw_response = json_value.get("response");
-
-            to_writer(&mut stdout, &json_value).unwrap();
-
-            return true;
-        })
-        .collect::<Vec<Value>>();
+        .collect::<Result<_, _>>()?;
 
     Ok(lines)
 }
