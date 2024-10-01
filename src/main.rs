@@ -682,12 +682,12 @@ fn show_summary(summary: &SharedSummary) {
     // let num_records = sorted_vec.len();
     // let earliest = str_from_json_no_err(sorted_vec.first(), &["time"]);
 
-    let mut total_events: usize = 0;
+    let mut total_filtered: usize = 0;
     for (index, (path, count)) in sorted_vec.into_iter().enumerate() {
         if index <= MAX_SUMMARY_LINES {
             table.add_row(vec![Cell::new(path), Cell::new(count)]);
         }
-        total_events += count;
+        total_filtered += count;
     }
 
     println!("{table}");
@@ -697,7 +697,7 @@ fn show_summary(summary: &SharedSummary) {
     ));
     ok_msg(format!(
         "Number of filtered records: {}",
-        total_events.fmt()
+        total_filtered.fmt()
     ))
 }
 
