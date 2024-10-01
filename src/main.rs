@@ -100,8 +100,8 @@ struct CliArgs {
     include_requests: bool,
 
     /// Show the date of the first and last log entries
-    #[arg(long = "dates", action = ArgAction::SetTrue)]
-    dates: bool,
+    #[arg(long = "show-date-range", action = ArgAction::SetTrue)]
+    show_date_range: bool,
 
     /// Show only the summary
     #[arg(long = "summary", action = ArgAction::SetTrue)]
@@ -922,7 +922,7 @@ fn main() {
     init_logger(Some("info"));
     let cli_args = CliArgs::parse();
     let start = Instant::now();
-    if cli_args.dates {
+    if cli_args.show_date_range {
         show_date_range(&cli_args.log_file).unwrap();
         return;
     }
