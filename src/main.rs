@@ -3,14 +3,14 @@ use clap::{ArgAction, Parser};
 use colored::{Color, ColoredString, Colorize};
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
 use dns_lookup::lookup_addr;
-use log::LevelFilter;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, Level, LevelFilter};
 use num_cpus;
 use num_format::{Locale, ToFormattedString};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
+use std::io::Write;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::sync::mpsc;
@@ -166,6 +166,11 @@ pub fn init_logger(level: Option<&str>) {
             }
         });
         builder.filter(None, log_level.parse().unwrap_or(LevelFilter::Info));
+        //builder.format(|buf, record| writeln!(buf, "{}: {}", record.level(), record.args()));
+        builder.format(|buf, record| match record.level() {
+            Level::Info => writeln!(buf, "{}", record.args()),
+            _ => writeln!(buf, "{}: {}", record.level(), record.args()),
+        });
         // Initialize the logger
         builder.init();
     });
