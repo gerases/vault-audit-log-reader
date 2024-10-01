@@ -696,14 +696,15 @@ fn show_summary(summary: &SharedSummary) {
     }
 
     println!("{table}");
-    ok_msg(format!(
-        "Number of un-filtered records: {}",
-        summary.lock().unwrap().total_events.fmt()
-    ));
-    ok_msg(format!(
-        "Number of filtered records: {}",
-        total_filtered.fmt()
-    ))
+
+    let total_records = summary.lock().unwrap().total_events;
+    ok_msg(format!("Total number of records: {}", total_records.fmt()));
+    if total_records != total_filtered {
+        ok_msg(format!(
+            "Number of filtered records: {}",
+            total_filtered.fmt()
+        ))
+    }
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummary) {
