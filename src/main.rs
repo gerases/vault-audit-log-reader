@@ -133,7 +133,7 @@ struct CliArgs {
     log_file: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Summary {
     count_by_path: HashMap<String, usize>,
     total_events: usize,
@@ -519,9 +519,11 @@ fn filter(
                     return false;
                 }
             }
-            // TODO: TEST!
-            let should_update_summary =
-                cli_args.summary || !cli_args.include_requests || event_type.as_str() == "request";
+            let should_update_summary = match(cli_args.include_requests, event_type.as_str()) {
+                (false, _)     => true,
+                (_, "request") => true,
+                (_, _)         => false,
+            };
             if should_update_summary {
                 *summary
                     .count_by_path
@@ -576,7 +578,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     let end = Instant::now();
     debug_msg!(format!("Range processing finished in {:?}", end - start,));
     let mut handles: Vec<JoinHandle<()>> = vec![];
-    let summary: Summary = Summary::new();
+    let summary = Summary::new();
     ranges.into_iter().for_each(|range| {
         let mut summary = summary.clone();
         let cli_args_clone = cli_args.clone();
@@ -1130,92 +1132,156 @@ mod tests {
 
         fn get_default_args() -> CliArgs {
             CliArgs {
-                id: None,
+                actor: None,
                 client_id: None,
-                threads: None,
-                // don't need it for this test
-                log_file: "not a file".to_string(),
-                raw: false,
-                include_requests: false,
-                summary: false,
-                path: None,
-                start_time: None,
                 end_time: None,
+                id: None,
+                include_requests: false,
+                log_file: "not a file".to_string(),
+                path: None,
+                raw: false,
+                start_time: None,
+                show_date_range: false,
+                summary: false,
+                threads: None,
             }
         }
 
         #[test]
         fn test_default_when_request() {
+            // When only a request is present, test it's filtered out by
+            // default.
             init_logger(None);
             let cli = get_default_args();
             let request = request();
-            let mut summary: HashMap<String, usize> = HashMap::new();
+            let mut summary = Summary::new();
             let lines: Vec<String> = vec![request.to_string()];
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
+
+            // Nothing should come through
+            let mut sum_expected = Summary::new();
+            sum_expected.total_events = 1; // event is still counted
             assert_eq!(filtered, Vec::<Value>::new());
+            assert_eq!(summary, sum_expected);
         }
 
         #[test]
         fn test_default_when_response() {
+            // Test that the response comes through
             init_logger(None);
             let cli = get_default_args();
             let response = response();
             let lines: Vec<String> = vec![response.to_string()];
 
-            let mut summary: HashMap<String, usize> = HashMap::new();
+            let mut summary = Summary::new();
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            let mut sum_expected = HashMap::new();
-            sum_expected.insert("some-path".to_string(), 1);
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 1);
+            sum_expected.total_events = 1;
 
             assert_eq!(filtered, vec![response]);
-            // assert_eq!(summary, sum_expected);
+            assert_eq!(summary, sum_expected);
         }
 
         #[test]
         fn test_with_requests_included() {
+            // Ensure requests are included when it's requested
             init_logger(None);
             let mut cli = get_default_args();
             cli.include_requests = true;
-            let request = request();
-            let lines: Vec<String> = vec![request.to_string()];
 
-            let mut summary: HashMap<String, usize> = HashMap::new();
+            let a_request = request();
+            let lines: Vec<String> = vec![a_request.to_string()];
+
+            let mut summary = Summary::new();
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 1);
+            sum_expected.total_events = 1;
+
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            let mut sum_expected = HashMap::new();
-            sum_expected.insert("some-path".to_string(), 1);
 
-            assert_eq!(filtered, vec![request]);
+            assert_eq!(filtered, vec![a_request]);
             assert_eq!(summary, sum_expected);
         }
 
         #[test]
-        fn test_with_1_req_and_two_responses() {
+        fn test_by_path_counting() {
+            // 1. If both requests and responses are included,
+            //    increment the by_path count ONLY IF request.
+            // 2. If only responses are included,
+            //    always increment the by_path count.
+
             init_logger(None);
 
-            // Test that when requests are present, only their paths are counted
+            // When requests included
             let mut cli = get_default_args();
-            cli.include_requests = true;
-
-            let request = request();
+            let request_1 = request();
             let response_1 = response();
-            let response_2 = response();
 
             let lines: Vec<String> = vec![
-                request.to_string(),
+                request_1.to_string(),
                 response_1.to_string(),
-                response_2.to_string(),
             ];
-            let mut summary: HashMap<String, usize> = HashMap::new();
-            let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            let mut sum_expected = HashMap::new();
-            sum_expected.insert("some-path".to_string(), 1);
+            cli.include_requests = true;
+            let mut summary = Summary::new();
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 1);
+            sum_expected.total_events = 2;
 
-            assert_eq!(filtered, vec![request, response_1, response_2]);
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            assert_eq!(filtered, vec![request_1, response_1]);
+            assert_eq!(summary, sum_expected);
+
+            // When requests are not included
+            let request_1 = request();
+            let response_1 = response();
+
+            let lines: Vec<String> = vec![
+                request_1.to_string(),
+                response_1.to_string(),
+            ];
+            cli.include_requests = false;
+            let mut summary = Summary::new();
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 1);
+            sum_expected.total_events = 2;
+
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            assert_eq!(filtered, vec![response_1]);
+            assert_eq!(summary, sum_expected);
+
+            // When summary is true
+            let request_1 = request();
+            let response_1 = response();
+
+            let lines: Vec<String> = vec![
+                request_1.to_string(),
+                response_1.to_string(),
+            ];
+            cli.summary = true;
+            cli.include_requests = true;
+            let mut summary = Summary::new();
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 1);
+            sum_expected.total_events = 2;
+
+            let filtered = filter(&cli, &lines, &mut summary).unwrap();
+            assert_eq!(filtered, Vec::<Value>::new());
             assert_eq!(summary, sum_expected);
         }
 
         #[test]
-        fn test_with_two_responses() {
+        fn test_with_date_range() {
             init_logger(None);
             // Test that when only responses are present, all of them
             // contribute to the by-path count.
@@ -1230,10 +1296,13 @@ mod tests {
                 response_1.to_string(),
                 response_2.to_string(),
             ];
-            let mut summary: HashMap<String, usize> = HashMap::new();
+            let mut summary = Summary::new();
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            let mut sum_expected = HashMap::new();
-            sum_expected.insert("some-path".to_string(), 2);
+            let mut sum_expected = Summary::new();
+            sum_expected
+                .count_by_path
+                .insert("some-path".to_string(), 2);
+            sum_expected.total_events = 3;
 
             assert_eq!(filtered, vec![response_1, response_2]);
             assert_eq!(summary, sum_expected);
