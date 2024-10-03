@@ -193,15 +193,12 @@ fn parse_timestamp(timestamp: &str) -> ParseResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(timestamp).map(|parsed_dt| parsed_dt.with_timezone(&Utc))
 }
 
-fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -> String {
+fn str_from_json<'a>(event_json: &'a Value, keys: &[&str]) -> String {
     let mut current_val = event_json;
     for key in keys {
         current_val = match current_val.get(*key) {
             Some(json) => json,
             None => {
-                if print_error {
-                    err_msg(format!("Missing key: {key}, event_json={:?}", event_json));
-                }
                 return String::new();
             }
         }
@@ -210,24 +207,8 @@ fn _str_from_json<'a>(event_json: &'a Value, keys: &[&str], print_error: bool) -
     match current_val {
         Value::String(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
-        _ => {
-            if print_error {
-                err_msg(format!(
-                    "Invalid value for key path: {:?}; current_val={:?}",
-                    keys, current_val
-                ));
-            }
-            String::new()
-        }
+        _ => String::new(),
     }
-}
-
-fn str_from_json<'a>(event_json: &'a Value, keys: &[&str]) -> String {
-    _str_from_json(event_json, keys, true)
-}
-
-fn str_from_json_no_err<'a>(event_json: &'a Value, keys: &[&str]) -> String {
-    _str_from_json(event_json, keys, false)
 }
 
 fn within_time_bounds<F>(timestamp_str: &Option<String>, checker: F) -> bool
@@ -284,13 +265,10 @@ fn format_hmac(token: &str) -> String {
 }
 
 fn tokens(event_json: &Value) -> String {
-    let auth_token = format_hmac(&str_from_json_no_err(
-        &event_json,
-        &["auth", "client_token"],
-    ));
-    let auth_accessor = format_hmac(&str_from_json_no_err(&event_json, &["auth", "accessor"]));
+    let auth_token = format_hmac(&str_from_json(&event_json, &["auth", "client_token"]));
+    let auth_accessor = format_hmac(&str_from_json(&event_json, &["auth", "accessor"]));
     let common = format!("ath-tok:{auth_token}\nath-acc:{auth_accessor}");
-    match str_from_json_no_err(&event_json, &["response", "auth", "accessor"]).len() {
+    match str_from_json(&event_json, &["response", "auth", "accessor"]).len() {
         0 => {
             let req_client_token =
                 format_hmac(&str_from_json(&event_json, &["request", "client_token"]));
@@ -473,7 +451,7 @@ fn filter(
         .filter(|event_json: &Value| {
             let event_type = str_from_json(&event_json, &["type"]);
             let vault_path = str_from_json(&event_json, &["request", "path"]);
-            let err = str_from_json_no_err(&event_json, &["error"]);
+            let err = str_from_json(&event_json, &["error"]);
 
             if event_type == "request" {
                 // if an error exists in a request,
@@ -508,21 +486,21 @@ fn filter(
                 }
             }
             if let Some(cli_client_id) = &cli_args.client_id {
-                let client_id = str_from_json_no_err(&event_json, &["request", "client_id"]);
+                let client_id = str_from_json(&event_json, &["request", "client_id"]);
                 if !client_id.starts_with(&*cli_client_id) {
                     return false;
                 }
             }
             if let Some(cli_actor) = &cli_args.actor {
-                let actor = str_from_json_no_err(&event_json, &["actor"]);
+                let actor = str_from_json(&event_json, &["actor"]);
                 if !actor.starts_with(&*cli_actor) {
                     return false;
                 }
             }
-            let should_update_summary = match(cli_args.include_requests, event_type.as_str()) {
-                (false, _)     => true,
+            let should_update_summary = match (cli_args.include_requests, event_type.as_str()) {
+                (false, _) => true,
                 (_, "request") => true,
-                (_, _)         => false,
+                (_, _) => false,
             };
             if should_update_summary {
                 *summary
@@ -687,7 +665,7 @@ fn show_summary(summary: &SharedSummary) {
     table.set_header(vec!["Path", "NumReq"]);
 
     // let num_records = sorted_vec.len();
-    // let earliest = str_from_json_no_err(sorted_vec.first(), &["time"]);
+    // let earliest = str_from_json(sorted_vec.first(), &["time"]);
 
     let mut total_filtered: usize = 0;
     for (index, (path, count)) in sorted_vec.into_iter().enumerate() {
@@ -760,7 +738,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummar
         table.set_header(headers);
         let mut row = vec![
             Cell::new(&format_id(&str_from_json(&event_json, &["request", "id"]))),
-            Cell::new(&format_id(&str_from_json_no_err(
+            Cell::new(&format_id(&str_from_json(
                 &event_json,
                 &["request", "client_id"],
             ))),
@@ -769,7 +747,7 @@ fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummar
             Cell::new(format!(
                 "{}/\n{}",
                 actor(&event_json),
-                format_id(&str_from_json_no_err(&event_json, &["auth", "entity_id"])),
+                format_id(&str_from_json(&event_json, &["auth", "entity_id"])),
             )),
             Cell::new(&tokens(&event_json)),
             Cell::new(&str_from_json(&event_json, &["request", "operation"])),
@@ -1070,7 +1048,7 @@ mod tests {
                 "key": "value"
             });
 
-            assert_eq!(str_from_json_no_err(&event_json, &["wrong"]), "");
+            assert_eq!(str_from_json(&event_json, &["wrong"]), "");
         }
 
         #[test]
@@ -1081,7 +1059,7 @@ mod tests {
                 }
             });
 
-            assert_eq!(str_from_json_no_err(&event_json, &["key1", "wrong"]), "");
+            assert_eq!(str_from_json(&event_json, &["key1", "wrong"]), "");
         }
     }
     mod test_filter {
@@ -1227,39 +1205,41 @@ mod tests {
             let a_request = request();
             let a_response = response(None);
 
-            vec![true, false].into_iter().for_each(|is_request_and_response| {
-                let mut sum_expected = Summary::new();
-                let events: Vec<Value> = match is_request_and_response {
-                    true => {
-                        cli.include_requests = true;
-                        sum_expected.total_events = 2;
-                        sum_expected
-                            .count_by_path
-                            .insert("some-path".to_string(), 1);
-                        vec![a_request.clone(), a_response.clone()]
-                    }
-                    false => {
-                        cli.include_requests = false;
-                        sum_expected.total_events = 1;
-                        sum_expected
-                            .count_by_path
-                            .insert("some-path".to_string(), 1);
-                        vec![a_response.clone()]
-                    }
-                };
+            vec![true, false]
+                .into_iter()
+                .for_each(|is_request_and_response| {
+                    let mut sum_expected = Summary::new();
+                    let events: Vec<Value> = match is_request_and_response {
+                        true => {
+                            cli.include_requests = true;
+                            sum_expected.total_events = 2;
+                            sum_expected
+                                .count_by_path
+                                .insert("some-path".to_string(), 1);
+                            vec![a_request.clone(), a_response.clone()]
+                        }
+                        false => {
+                            cli.include_requests = false;
+                            sum_expected.total_events = 1;
+                            sum_expected
+                                .count_by_path
+                                .insert("some-path".to_string(), 1);
+                            vec![a_response.clone()]
+                        }
+                    };
 
-                // {{{
-                println!("BOTH EVENTS IS {}", is_request_and_response);
-                let mut summary = Summary::new();
-                let filtered = filter(
-                    &cli,
-                    &events.iter().map(|event| event.to_string()).collect(),
-                    &mut summary,
-                )
-                .unwrap();
-                assert_eq!(filtered, events);
-                assert_eq!(summary, sum_expected);
-            });
+                    // {{{
+                    println!("BOTH EVENTS IS {}", is_request_and_response);
+                    let mut summary = Summary::new();
+                    let filtered = filter(
+                        &cli,
+                        &events.iter().map(|event| event.to_string()).collect(),
+                        &mut summary,
+                    )
+                    .unwrap();
+                    assert_eq!(filtered, events);
+                    assert_eq!(summary, sum_expected);
+                });
         }
 
         #[test]
