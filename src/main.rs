@@ -1070,7 +1070,7 @@ mod tests {
                 "key": "value"
             });
 
-            assert_eq!(str_from_json(&event_json, &["wrong"]), "");
+            assert_eq!(str_from_json_no_err(&event_json, &["wrong"]), "");
         }
 
         #[test]
@@ -1081,7 +1081,7 @@ mod tests {
                 }
             });
 
-            assert_eq!(str_from_json(&event_json, &["key1", "wrong"]), "");
+            assert_eq!(str_from_json_no_err(&event_json, &["key1", "wrong"]), "");
         }
     }
     mod test_filter {
