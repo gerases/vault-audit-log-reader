@@ -1054,6 +1054,7 @@ mod tests {
 
         #[test]
         fn with_second_level_key() {
+            init_logger(None);
             let event_json = json!({
                 "key1": {
                     "key2": "value",
@@ -1086,7 +1087,7 @@ mod tests {
     mod test_filter {
         use super::*;
 
-        fn response() -> Value {
+        fn response(mods: Option<(&str, &str)>) -> Value {
             let mut response = request();
             let response_data = json!({
                 "response": {
@@ -1097,10 +1098,14 @@ mod tests {
                 }
             });
 
-            // Check if `json_value` is an object and add the new data
             if let Some(obj) = response.as_object_mut() {
                 obj.extend(response_data.as_object().unwrap().clone());
                 obj.insert("type".to_string(), Value::String("response".to_string()));
+
+                if let Some((key, val)) = mods {
+                    obj.extend(response_data.as_object().unwrap().clone());
+                    obj.insert(key.to_string(), Value::String(val.to_string()));
+                }
             }
 
             return response;
@@ -1170,7 +1175,7 @@ mod tests {
             // Test that the response comes through
             init_logger(None);
             let cli = get_default_args();
-            let response = response();
+            let response = response(None);
             let lines: Vec<String> = vec![response.to_string()];
 
             let mut summary = Summary::new();
@@ -1219,93 +1224,104 @@ mod tests {
 
             // When requests included
             let mut cli = get_default_args();
-            let request_1 = request();
-            let response_1 = response();
+            let a_request = request();
+            let a_response = response(None);
 
-            let lines: Vec<String> = vec![
-                request_1.to_string(),
-                response_1.to_string(),
-            ];
-            cli.include_requests = true;
-            let mut summary = Summary::new();
-            let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 1);
-            sum_expected.total_events = 2;
+            vec![true, false].into_iter().for_each(|is_request_and_response| {
+                let mut sum_expected = Summary::new();
+                let events: Vec<Value> = match is_request_and_response {
+                    true => {
+                        cli.include_requests = true;
+                        sum_expected.total_events = 2;
+                        sum_expected
+                            .count_by_path
+                            .insert("some-path".to_string(), 1);
+                        vec![a_request.clone(), a_response.clone()]
+                    }
+                    false => {
+                        cli.include_requests = false;
+                        sum_expected.total_events = 1;
+                        sum_expected
+                            .count_by_path
+                            .insert("some-path".to_string(), 1);
+                        vec![a_response.clone()]
+                    }
+                };
 
-            let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            assert_eq!(filtered, vec![request_1, response_1]);
-            assert_eq!(summary, sum_expected);
-
-            // When requests are not included
-            let request_1 = request();
-            let response_1 = response();
-
-            let lines: Vec<String> = vec![
-                request_1.to_string(),
-                response_1.to_string(),
-            ];
-            cli.include_requests = false;
-            let mut summary = Summary::new();
-            let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 1);
-            sum_expected.total_events = 2;
-
-            let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            assert_eq!(filtered, vec![response_1]);
-            assert_eq!(summary, sum_expected);
-
-            // When summary is true
-            let request_1 = request();
-            let response_1 = response();
-
-            let lines: Vec<String> = vec![
-                request_1.to_string(),
-                response_1.to_string(),
-            ];
-            cli.summary = true;
-            cli.include_requests = true;
-            let mut summary = Summary::new();
-            let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 1);
-            sum_expected.total_events = 2;
-
-            let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            assert_eq!(filtered, Vec::<Value>::new());
-            assert_eq!(summary, sum_expected);
+                // {{{
+                println!("BOTH EVENTS IS {}", is_request_and_response);
+                let mut summary = Summary::new();
+                let filtered = filter(
+                    &cli,
+                    &events.iter().map(|event| event.to_string()).collect(),
+                    &mut summary,
+                )
+                .unwrap();
+                assert_eq!(filtered, events);
+                assert_eq!(summary, sum_expected);
+            });
         }
 
         #[test]
         fn test_with_date_range() {
             init_logger(None);
-            // Test that when only responses are present, all of them
-            // contribute to the by-path count.
-            let cli = get_default_args();
-            let request = request();
-            let response_1 = response();
-            let response_2 = response();
+            let mut cli = get_default_args();
 
-            let lines: Vec<String> = vec![
-                request.to_string(), // this should be filtered out because
-                // include_requests is absent
-                response_1.to_string(),
-                response_2.to_string(),
+            // each tuple is start_time, end_time, response_time, expect
+            let test_cases: Vec<(Option<&str>, Option<&str>, &str, bool)> = vec![
+                (
+                    Some("2024-01-01T00:00:01Z"),
+                    None,
+                    "2024-01-01T00:00:00Z",
+                    false,
+                ),
+                (
+                    Some("2024-01-01T00:00:01Z"),
+                    None,
+                    "2024-01-01T00:00:02Z",
+                    true,
+                ),
+                (
+                    None,
+                    Some("2024-01-01T00:00:00Z"),
+                    "2024-01-01T00:00:01Z",
+                    false,
+                ),
+                (
+                    None,
+                    Some("2024-01-01T00:00:02Z"),
+                    "2024-01-01T00:00:01Z",
+                    true,
+                ),
+                (
+                    Some("2024-01-01T00:00:00Z"),
+                    Some("2024-01-01T00:00:02Z"),
+                    "2024-01-01T00:00:03Z",
+                    false,
+                ),
+                (
+                    Some("2024-01-01T00:00:00Z"),
+                    Some("2024-01-01T00:00:02Z"),
+                    "2024-01-01T00:00:01Z",
+                    true,
+                ),
             ];
-            let mut summary = Summary::new();
-            let filtered = filter(&cli, &lines, &mut summary).unwrap();
-            let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 2);
-            sum_expected.total_events = 3;
+            test_cases
+                .into_iter()
+                .for_each(|(start_time, end_time, response_time, expect)| {
+                    let a_response = response(Some(("time", response_time)));
+                    let lines: Vec<String> = vec![a_response.to_string()];
+                    let mut summary = Summary::new();
 
-            assert_eq!(filtered, vec![response_1, response_2]);
-            assert_eq!(summary, sum_expected);
+                    if let Some(s_time) = start_time {
+                        cli.start_time = Some(s_time.to_string());
+                    }
+                    if let Some(e_time) = end_time {
+                        cli.end_time = Some(e_time.to_string());
+                    }
+                    let filtered = filter(&cli, &lines, &mut summary).unwrap();
+                    assert_eq!(filtered, if expect { vec![a_response] } else { vec![] });
+                });
         }
     }
 }
