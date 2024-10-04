@@ -1,9 +1,21 @@
+mod cli;
+
+extern crate clap;
+extern crate chrono;
+extern crate colored;
+extern crate comfy_table;
+extern crate log;
+extern crate num_format;
+extern crate serde_json;
+extern crate termcolor;
+extern crate termcolor_json;
+
 use chrono::{DateTime, ParseResult, Utc};
-use clap::{ArgAction, Parser};
+use clap::Parser;
+use cli::CliArgs;
 use colored::{Color, ColoredString, Colorize};
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
 use log::{debug, error, info, trace, Level, LevelFilter};
-use num_cpus;
 use num_format::{Locale, ToFormattedString};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -63,72 +75,6 @@ impl CustomColors for str {
             b: 104,
         })
     }
-}
-
-#[derive(Parser, Debug, Clone)]
-#[command(name = "Read vault audit log", version = "1.0")]
-struct CliArgs {
-    /// Limit to a request with a given id
-    #[arg(long = "id", value_name = "Request-Id", help = "filter by request id")]
-    id: Option<String>,
-
-    /// Limit to requests with a given client id
-    #[arg(
-        long = "actor",
-        value_name = "user_id",
-        conflicts_with = "summary",
-        help = "id of the actor (e.g. username or role name)"
-    )]
-    actor: Option<String>,
-
-    /// Limit to requests with a given client id
-    #[arg(
-        long = "client-id",
-        value_name = "Client-Id",
-        help = "filter by client id"
-    )]
-    client_id: Option<String>,
-
-    /// Specify number of workers
-    #[arg(short = 'T', long = "threads")]
-    threads: Option<usize>,
-
-    /// Include requests too
-    #[arg(short = 'R', long = "include-requests", action = ArgAction::SetTrue)]
-    include_requests: bool,
-
-    /// Show the date of the first and last log entries
-    #[arg(long = "show-date-range", action = ArgAction::SetTrue)]
-    show_date_range: bool,
-
-    /// Show only the summary
-    #[arg(long = "summary", action = ArgAction::SetTrue)]
-    summary: bool,
-
-    /// Specify beginning time (e.g. 2024-08-16T18:10:16Z)
-    #[arg(short = 's', long = "start-time")]
-    start_time: Option<String>,
-
-    /// Specify end time (e.g. 2024-08-16T18:10:16Z)
-    #[arg(short = 'e', long = "end-time")]
-    end_time: Option<String>,
-
-    /// Print unabridged entries
-    #[arg(short = 'r', long = "raw", action = ArgAction::SetTrue, conflicts_with = "summary")]
-    raw: bool,
-
-    /// Vault path
-    #[arg(
-        short = 'p',
-        long = "path",
-        conflicts_with = "summary",
-        value_name = "VAULT_PATH"
-    )]
-    path: Option<String>,
-
-    /// Log file
-    #[arg(short = 'f', long = "file", value_name = "LOG_FILE", required = true)]
-    log_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
