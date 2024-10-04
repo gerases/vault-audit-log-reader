@@ -2,7 +2,6 @@ use chrono::{DateTime, ParseResult, Utc};
 use clap::{ArgAction, Parser};
 use colored::{Color, ColoredString, Colorize};
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
-use dns_lookup::lookup_addr;
 use log::{debug, error, info, trace, Level, LevelFilter};
 use num_cpus;
 use num_format::{Locale, ToFormattedString};
@@ -12,7 +11,6 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
-use std::net::IpAddr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::JoinHandle;
@@ -294,29 +292,6 @@ fn col2idx(table: &Table, title: &str) -> usize {
     }
     err_msg_with_exit(format!("Can't find a header column with title='{title}'"));
     return 0;
-}
-
-#[allow(dead_code)]
-fn resolve_ip_to_hostname(ip: IpAddr) -> Result<String, Box<dyn std::error::Error>> {
-    let hostname = lookup_addr(&ip)?;
-    Ok(hostname)
-}
-
-#[allow(dead_code)]
-fn format_ipv4_addr(remote_addr: &str) -> String {
-    if remote_addr == "" {
-        return String::from("Remote addr missing");
-    }
-
-    let addr: IpAddr = remote_addr.parse().unwrap_or_else(|error| {
-        err_msg(format!("Couldn't parse '{remote_addr}': {error}").into());
-        "0.0.0.0".parse().unwrap()
-    });
-
-    return match resolve_ip_to_hostname(addr) {
-        Ok(hostname) => hostname,
-        Err(_) => format!("Can't resolve '{}'", remote_addr),
-    };
 }
 
 fn split_into_ranges(filename: &str, num_ranges: usize) -> io::Result<Vec<std::ops::Range<u64>>> {
