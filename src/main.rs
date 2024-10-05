@@ -1,15 +1,5 @@
 mod cli;
 
-extern crate clap;
-extern crate chrono;
-extern crate colored;
-extern crate comfy_table;
-extern crate log;
-extern crate num_format;
-extern crate serde_json;
-extern crate termcolor;
-extern crate termcolor_json;
-
 use chrono::{DateTime, ParseResult, Utc};
 use clap::Parser;
 use cli::CliArgs;

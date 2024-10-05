@@ -1,5 +1,3 @@
-extern crate clap;
-
 use clap::{ArgAction, Parser};
 
 #[derive(Parser, Debug, Clone)]
