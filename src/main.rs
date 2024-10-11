@@ -350,7 +350,17 @@ fn filter(
         .filter_map(|line| {
             count += 1;
             match serde_json::from_str(&line) {
-                Ok(json) => Some(json),
+                Ok(json) => {
+                    // Parse the timestamp once here and return a tuple of (event_json, event_time)
+                    let event_time_str = str_from_json(&json, &["time"]);
+                    match parse_timestamp(&event_time_str) {
+                        Ok(event_time) => Some((json, event_time)), // Return event and its parsed time
+                        Err(err) => {
+                            err_msg(format!("Can't parse {event_time_str}: {err}"));
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
                     err_msg(format!(
                         "Failed to convert the following line to JSON: '{line}': {e}"
@@ -359,7 +369,10 @@ fn filter(
                 }
             }
         })
-        .filter(|event_json: &Value| {
+        .take_while(|(_, event_time)| {
+            within_time_bounds(&cli_args.end_time, |end_time| event_time <= end_time)
+        })
+        .filter(|(event_json, _)| {
             let event_type = str_from_json(&event_json, &["type"]);
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json(&event_json, &["error"]);
@@ -384,10 +397,8 @@ fn filter(
                     return false;
                 }
             };
+            // we check for the start time bound in the take_while above
             if !within_time_bounds(&cli_args.start_time, |start_time| &event_time >= start_time) {
-                return false;
-            }
-            if !within_time_bounds(&cli_args.end_time, |end_time| &event_time <= end_time) {
                 return false;
             }
             if let Some(id) = &cli_args.id {
@@ -426,6 +437,7 @@ fn filter(
             }
             return true;
         })
+        .map(|(event_json, _)| event_json)
         .collect::<Vec<Value>>();
 
     summary.total_events = count;
