@@ -1,4 +1,21 @@
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
+use std::fmt;
+
+#[derive(Debug, Parser, Clone, ValueEnum)]
+pub enum CountBy {
+    Path,
+    Actor,
+}
+
+// Manually implement Display for CountBy
+impl fmt::Display for CountBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CountBy::Path => write!(f, "Path"),
+            CountBy::Actor => write!(f, "Actor"),
+        }
+    }
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "Read vault audit log", version = "1.0")]
@@ -64,5 +81,7 @@ pub struct CliArgs {
     /// Log file
     #[arg(short = 'f', long = "file", value_name = "LOG_FILE", required = true)]
     pub log_file: String,
-}
 
+    #[arg(short = 'c', long = "count-by", value_name = "ITEM", default_value = "path")]
+    pub count_by: CountBy,
+}

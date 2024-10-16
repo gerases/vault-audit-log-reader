@@ -2,7 +2,7 @@ mod cli;
 
 use chrono::{DateTime, ParseResult, Utc};
 use clap::Parser;
-use cli::CliArgs;
+use cli::{CliArgs, CountBy};
 use colored::{Color, ColoredString, Colorize};
 use comfy_table::{presets::UTF8_FULL, Cell, ColumnConstraint, Table, Width};
 use log::{debug, error, info, trace, Level, LevelFilter};
@@ -69,7 +69,7 @@ impl CustomColors for str {
 
 #[derive(Debug, Clone, PartialEq)]
 struct Summary {
-    count_by_path: HashMap<String, usize>,
+    count_by: HashMap<String, usize>,
     processed_events: usize,
     filtered_events: usize,
 }
@@ -77,7 +77,7 @@ struct Summary {
 impl Summary {
     fn new() -> Self {
         Summary {
-            count_by_path: HashMap::new(),
+            count_by: HashMap::new(),
             filtered_events: 0,
             processed_events: 0,
         }
@@ -173,20 +173,7 @@ fn actor(json_event: &Value) -> String {
             },
             None => str_from_json(auth_json, &["display_name"]).to_string(),
         },
-        None => {
-            err_msg(format!("Can't get auth section for request_id={}", id(&json_event)).into());
-            "".to_string()
-        }
-    }
-}
-
-fn id(json_event: &Value) -> String {
-    match json_event.get("id") {
-        Some(id) => return id.to_string(),
-        None => {
-            err_msg(format!("Can't get id out of {:?}", json_event));
-            "".to_string()
-        }
+        None => "".to_string(),
     }
 }
 
@@ -379,7 +366,7 @@ fn filter(
             let event_type = str_from_json(&event_json, &["type"]);
             let vault_path = str_from_json(&event_json, &["request", "path"]);
             let err = str_from_json(&event_json, &["error"]);
-
+            let actor = actor(&event_json);
             if event_type == "request" {
                 // if an error exists in a request,
                 // show it even if it was not requested
@@ -417,7 +404,6 @@ fn filter(
                 }
             }
             if let Some(cli_actor) = &cli_args.actor {
-                let actor = str_from_json(&event_json, &["actor"]);
                 if !actor.starts_with(&*cli_actor) {
                     return false;
                 }
@@ -428,9 +414,13 @@ fn filter(
                 (_, _) => false,
             };
             if should_update_summary {
+                let count_by_item = match &cli_args.count_by {
+                    CountBy::Path => &vault_path,
+                    _ => &actor,
+                };
                 *summary
-                    .count_by_path
-                    .entry(vault_path.to_string())
+                    .count_by
+                    .entry(count_by_item.to_string())
                     .or_insert(0) += 1;
             }
             filtered_events += 1;
@@ -527,15 +517,15 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
                 "Post-processing thread {:?} begins working on {} lines and {} summary entries",
                 std::thread::current().id(),
                 queue.len(),
-                summary.count_by_path.len(),
+                summary.count_by.len(),
             )
             .brown());
             global_queue_clone.lock().unwrap().extend(queue);
-            for (key, val) in summary.count_by_path {
+            for (key, val) in summary.count_by {
                 *global_summary_clone
                     .lock()
                     .unwrap()
-                    .count_by_path
+                    .count_by
                     .entry(key)
                     .or_insert(0) += val;
             }
@@ -572,11 +562,11 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
     Ok(())
 }
 
-fn show_summary(summary: &SharedSummary) {
+fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
     let mut sorted_vec: Vec<(String, usize)> = summary
         .lock()
         .unwrap()
-        .count_by_path
+        .count_by
         .iter()
         .map(|(k, &v)| (k.clone(), v))
         .collect();
@@ -585,7 +575,7 @@ fn show_summary(summary: &SharedSummary) {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
-    table.set_header(vec!["Path", "NumReq"]);
+    table.set_header(vec![cli_args.count_by.to_string(), "NumReq".to_string()]);
 
     sorted_vec
         .into_iter()
@@ -609,7 +599,7 @@ fn show_summary(summary: &SharedSummary) {
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummary) {
     if cli_args.summary {
-        show_summary(summary);
+        show_summary(&cli_args, summary);
         return;
     }
 
@@ -1037,6 +1027,7 @@ mod tests {
             CliArgs {
                 actor: None,
                 client_id: None,
+                count_by: CountBy::Path,
                 end_time: None,
                 id: None,
                 include_requests: false,
@@ -1079,9 +1070,7 @@ mod tests {
             let mut summary = Summary::new();
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
             let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 1);
+            sum_expected.count_by.insert("some-path".to_string(), 1);
             sum_expected.processed_events = 1;
             sum_expected.filtered_events = 1;
 
@@ -1101,9 +1090,7 @@ mod tests {
 
             let mut summary = Summary::new();
             let mut sum_expected = Summary::new();
-            sum_expected
-                .count_by_path
-                .insert("some-path".to_string(), 1);
+            sum_expected.count_by.insert("some-path".to_string(), 1);
             sum_expected.processed_events = 1;
             sum_expected.filtered_events = 1;
 
@@ -1136,18 +1123,14 @@ mod tests {
                             cli.include_requests = true;
                             sum_expected.processed_events = 2;
                             sum_expected.filtered_events = 2;
-                            sum_expected
-                                .count_by_path
-                                .insert("some-path".to_string(), 1);
+                            sum_expected.count_by.insert("some-path".to_string(), 1);
                             vec![a_request.clone(), a_response.clone()]
                         }
                         false => {
                             cli.include_requests = false;
                             sum_expected.processed_events = 1;
                             sum_expected.filtered_events = 1;
-                            sum_expected
-                                .count_by_path
-                                .insert("some-path".to_string(), 1);
+                            sum_expected.count_by.insert("some-path".to_string(), 1);
                             vec![a_response.clone()]
                         }
                     };
