@@ -70,7 +70,7 @@ impl CustomColors for str {
 #[derive(Debug, Clone, PartialEq)]
 struct Summary {
     count_by_path: HashMap<String, usize>,
-    total_events: usize,
+    processed_events: usize,
     filtered_events: usize,
 }
 
@@ -79,7 +79,7 @@ impl Summary {
         Summary {
             count_by_path: HashMap::new(),
             filtered_events: 0,
-            total_events: 0,
+            processed_events: 0,
         }
     }
 }
@@ -346,12 +346,12 @@ fn filter(
     )
     .yellow());
 
-    let mut total_events: usize = 0;
+    let mut processed_events: usize = 0;
     let mut filtered_events: usize = 0;
     let result = lines
         .into_iter()
         .filter_map(|line| {
-            total_events += 1;
+            processed_events += 1;
             match serde_json::from_str(&line) {
                 Ok(json) => {
                     // Parse the timestamp once here and return a tuple of (event_json, event_time)
@@ -444,7 +444,7 @@ fn filter(
         .map(|(event_json, _)| event_json)
         .collect::<Vec<Value>>();
 
-    summary.total_events = total_events;
+    summary.processed_events = processed_events;
     summary.filtered_events = filtered_events;
 
     let end = Instant::now();
@@ -539,7 +539,7 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
                     .entry(key)
                     .or_insert(0) += val;
             }
-            global_summary_clone.lock().unwrap().total_events += summary.total_events;
+            global_summary_clone.lock().unwrap().processed_events += summary.processed_events;
             global_summary_clone.lock().unwrap().filtered_events += summary.filtered_events;
 
             let end = Instant::now();
@@ -595,11 +595,11 @@ fn show_summary(summary: &SharedSummary) {
         });
     println!("{table}");
 
-    let total_events = summary.lock().unwrap().total_events;
+    let processed_events = summary.lock().unwrap().processed_events;
     let filtered_events = summary.lock().unwrap().filtered_events;
-    ok_msg(format!("Total number of records: {}", total_events.fmt()));
+    ok_msg(format!("Total number of records: {}", processed_events.fmt()));
 
-    if total_events != filtered_events {
+    if processed_events != filtered_events {
         ok_msg(format!(
             "Number of filtered records: {}",
             filtered_events.fmt()
@@ -1063,7 +1063,7 @@ mod tests {
 
             // Nothing should come through
             let mut sum_expected = Summary::new();
-            sum_expected.total_events = 1; // event is still counted
+            sum_expected.processed_events = 1; // event is still counted
             assert_eq!(filtered, Vec::<Value>::new());
             assert_eq!(summary, sum_expected);
         }
@@ -1082,7 +1082,7 @@ mod tests {
             sum_expected
                 .count_by_path
                 .insert("some-path".to_string(), 1);
-            sum_expected.total_events = 1;
+            sum_expected.processed_events = 1;
             sum_expected.filtered_events = 1;
 
             assert_eq!(filtered, vec![response]);
@@ -1104,7 +1104,7 @@ mod tests {
             sum_expected
                 .count_by_path
                 .insert("some-path".to_string(), 1);
-            sum_expected.total_events = 1;
+            sum_expected.processed_events = 1;
             sum_expected.filtered_events = 1;
 
             let filtered = filter(&cli, &lines, &mut summary).unwrap();
@@ -1134,7 +1134,7 @@ mod tests {
                     let events: Vec<Value> = match is_request_and_response {
                         true => {
                             cli.include_requests = true;
-                            sum_expected.total_events = 2;
+                            sum_expected.processed_events = 2;
                             sum_expected.filtered_events = 2;
                             sum_expected
                                 .count_by_path
@@ -1143,7 +1143,7 @@ mod tests {
                         }
                         false => {
                             cli.include_requests = false;
-                            sum_expected.total_events = 1;
+                            sum_expected.processed_events = 1;
                             sum_expected.filtered_events = 1;
                             sum_expected
                                 .count_by_path
@@ -1238,13 +1238,13 @@ mod tests {
             // Cause zero filtered records to be returned
             cli.path = Some("non-existing-path".to_string());
             filter(&cli, &lines, &mut summary).unwrap();
-            assert_eq!(summary.total_events, 1);
+            assert_eq!(summary.processed_events, 1);
             assert_eq!(summary.filtered_events, 0);
 
             // Cause the total and filtered counts to match
             cli.path = None;
             filter(&cli, &lines, &mut summary).unwrap();
-            assert_eq!(summary.total_events, 1);
+            assert_eq!(summary.processed_events, 1);
             assert_eq!(summary.filtered_events, 1);
         }
     }
