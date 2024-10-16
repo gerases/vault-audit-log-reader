@@ -24,7 +24,6 @@ type SharedQueue<T> = Arc<Mutex<HashSet<T>>>;
 type SharedSummary = Arc<Mutex<Summary>>;
 
 static INIT: Once = Once::new();
-const MAX_SUMMARY_LINES: usize = 10;
 // Human-friendly length of HMAC values
 const HMAC_LEN: usize = 10;
 // Hmac prefix
@@ -579,7 +578,7 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
 
     sorted_vec
         .into_iter()
-        .take(MAX_SUMMARY_LINES)
+        .take(cli_args.max_summary_items)
         .for_each(|(path, count)| {
             table.add_row(vec![Cell::new(path), Cell::new(count)]);
         });

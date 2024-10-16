@@ -1,5 +1,8 @@
 use clap::{ArgAction, Parser, ValueEnum};
+use std::ffi::OsString;
 use std::fmt;
+
+const MAX_SUMMARY_LINES: usize = 10;
 
 #[derive(Debug, Parser, Clone, ValueEnum)]
 pub enum CountBy {
@@ -82,6 +85,19 @@ pub struct CliArgs {
     #[arg(short = 'f', long = "file", value_name = "LOG_FILE", required = true)]
     pub log_file: String,
 
-    #[arg(short = 'c', long = "count-by", value_name = "ITEM", default_value = "path")]
+    #[arg(
+        short = 'c',
+        long = "count-by",
+        value_name = "ITEM",
+        default_value = "path"
+    )]
     pub count_by: CountBy,
+
+    #[arg(
+        short = 'm',
+        long = "--max-summary-items",
+        value_name = "NUM",
+        default_value_os = "10"
+    )]
+    pub max_summary_items: usize,
 }
