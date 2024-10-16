@@ -117,7 +117,7 @@ fn ok_msg(msg: String) {
 }
 
 fn err_msg(msg: String) {
-    error!("ERROR: {}", msg.red());
+    error!("{}", msg.red());
 }
 
 fn err_msg_with_exit(msg: String) {
