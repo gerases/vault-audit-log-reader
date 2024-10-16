@@ -577,23 +577,21 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
     table.set_header(vec![cli_args.count_by.to_string(), "NumReq".to_string()]);
 
     sorted_vec
-        .into_iter()
+        .iter()
         .take(cli_args.max_summary_items)
         .for_each(|(path, count)| {
             table.add_row(vec![Cell::new(path), Cell::new(count)]);
         });
     println!("{table}");
 
-    let processed_events = summary.lock().unwrap().processed_events;
-    let filtered_events = summary.lock().unwrap().filtered_events;
-    ok_msg(format!("Processed records: {}", processed_events.fmt()));
+    ok_msg(format!("{:<22} {}", "items in the summary:", sorted_vec.len()));
 
-    if processed_events != filtered_events {
-        ok_msg(format!(
-            "Number of filtered records: {}",
-            filtered_events.fmt()
-        ))
-    }
+    let filtered_events = summary.lock().unwrap().filtered_events;
+    ok_msg(format!(
+        "{:<22} {}",
+        "processed events:",
+        filtered_events.fmt()
+    ))
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummary) {

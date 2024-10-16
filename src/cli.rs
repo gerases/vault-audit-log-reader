@@ -1,8 +1,5 @@
 use clap::{ArgAction, Parser, ValueEnum};
-use std::ffi::OsString;
 use std::fmt;
-
-const MAX_SUMMARY_LINES: usize = 10;
 
 #[derive(Debug, Parser, Clone, ValueEnum)]
 pub enum CountBy {
@@ -95,7 +92,7 @@ pub struct CliArgs {
 
     #[arg(
         short = 'm',
-        long = "--max-summary-items",
+        long = "max-summary-items",
         value_name = "NUM",
         default_value_os = "10"
     )]
