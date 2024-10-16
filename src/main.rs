@@ -164,8 +164,8 @@ where
     }
 }
 
-fn actor(json_event: &Value) -> String {
-    match json_event.get("auth") {
+fn actor(event_json: &Value) -> String {
+    match event_json.get("auth") {
         Some(auth_json) => match auth_json.get("metadata") {
             Some(value) => match value.get("role_name") {
                 Some(role_name) => role_name.as_str().unwrap().to_string(),
