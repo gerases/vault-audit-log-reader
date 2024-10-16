@@ -590,18 +590,18 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
         });
     println!("{table}");
 
-    ok_msg(format!(
-        "{:<22} {}",
-        "items in the summary:",
-        sorted_vec.len()
-    ));
-
     let filtered_events = summary.lock().unwrap().filtered_events;
-    ok_msg(format!(
-        "{:<22} {}",
-        "processed events:",
-        filtered_events.fmt()
-    ))
+    macro_rules! fmt_msg {
+        ($label:expr, $value:expr) => {
+            format!("{:<28} {}", $label, $value)
+        };
+    }
+    ok_msg(fmt_msg!(
+        "shown items in the summary:",
+        std::cmp::min(cli_args.max_summary_items, sorted_vec.len())
+    ));
+    ok_msg(fmt_msg!("total items in the summary:", sorted_vec.len()));
+    ok_msg(fmt_msg!("processed events:", filtered_events.fmt()));
 }
 
 fn output(cli_args: &CliArgs, queue: &SharedQueue<Value>, summary: &SharedSummary) {
