@@ -491,21 +491,15 @@ fn process(cli_args: &CliArgs) -> std::io::Result<()> {
         let tx = tx.clone();
         let handle = std::thread::spawn(move || {
             let thread_id = std::thread::current().id();
+            let (size, unit) = if range.end - range.start >= 1_000_000 {
+                ((range.end - range.start) as f64 / 1_000_000.0, "MB") // in MB
+            } else {
+                ((range.end - range.start) as f64 / 1_000.0, "KB") // in KB
+            };
             // TODO: move inside filter potentially
             debug_msg!(format!(
-                "Thread={:?} will process {:?} bytes ({}) {}",
-                thread_id,
-                range,
-                if range.end - range.start >= 1_000_000 {
-                    (range.end - range.start) as f64 / 1_000_000.0 // in MB
-                } else {
-                    (range.end - range.start) as f64 / 1_000.0 // in KB
-                },
-                if range.end - range.start >= 1_000_000 {
-                    "MB"
-                } else {
-                    "KB"
-                },
+                "Thread={:?} will process {:?} bytes ({size:.2} {unit})",
+                thread_id, range
             )
             .yellow());
             let lines = read_range(&cli_args_clone.log_file, range.clone()).unwrap();
