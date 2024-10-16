@@ -7,7 +7,6 @@ pub enum CountBy {
     Actor,
 }
 
-// Manually implement Display for CountBy
 impl fmt::Display for CountBy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
