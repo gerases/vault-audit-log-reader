@@ -586,7 +586,7 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
         .iter()
         .take(cli_args.max_summary_items.unwrap_or(usize::MAX))
         .for_each(|(path, count)| {
-            table.add_row(vec![Cell::new(path), Cell::new(count)]);
+            table.add_row(vec![Cell::new(path), Cell::new(count.fmt())]);
         });
     println!("{table}");
 
