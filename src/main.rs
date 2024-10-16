@@ -567,7 +567,13 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
         .unwrap()
         .count_by
         .iter()
-        .map(|(k, &v)| (k.clone(), v))
+        .filter_map(|(k, &v)| {
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.clone(), v))
+            }
+        })
         .collect();
 
     sorted_vec.sort_by(|a, b| b.1.cmp(&a.1));
@@ -584,7 +590,11 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
         });
     println!("{table}");
 
-    ok_msg(format!("{:<22} {}", "items in the summary:", sorted_vec.len()));
+    ok_msg(format!(
+        "{:<22} {}",
+        "items in the summary:",
+        sorted_vec.len()
+    ));
 
     let filtered_events = summary.lock().unwrap().filtered_events;
     ok_msg(format!(
