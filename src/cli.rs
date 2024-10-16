@@ -93,8 +93,7 @@ pub struct CliArgs {
     #[arg(
         short = 'm',
         long = "max-summary-items",
-        value_name = "NUM",
-        default_value_os = "10"
+        value_name = "NUM"
     )]
-    pub max_summary_items: usize,
+    pub max_summary_items: Option<usize>,
 }

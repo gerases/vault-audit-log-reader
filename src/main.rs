@@ -584,7 +584,7 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
 
     sorted_vec
         .iter()
-        .take(cli_args.max_summary_items)
+        .take(cli_args.max_summary_items.unwrap_or(usize::MAX))
         .for_each(|(path, count)| {
             table.add_row(vec![Cell::new(path), Cell::new(count)]);
         });
@@ -593,14 +593,10 @@ fn show_summary(cli_args: &CliArgs, summary: &SharedSummary) {
     let filtered_events = summary.lock().unwrap().filtered_events;
     macro_rules! fmt_msg {
         ($label:expr, $value:expr) => {
-            format!("{:<28} {}", $label, $value)
+            format!("{:<20} {}", $label, $value)
         };
     }
-    ok_msg(fmt_msg!(
-        "shown items in the summary:",
-        std::cmp::min(cli_args.max_summary_items, sorted_vec.len())
-    ));
-    ok_msg(fmt_msg!("total items in the summary:", sorted_vec.len()));
+    ok_msg(fmt_msg!("total summary items:", sorted_vec.len()));
     ok_msg(fmt_msg!("processed events:", filtered_events.fmt()));
 }
 
