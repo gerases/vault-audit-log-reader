@@ -597,7 +597,7 @@ fn show_summary(summary: &SharedSummary) {
 
     let processed_events = summary.lock().unwrap().processed_events;
     let filtered_events = summary.lock().unwrap().filtered_events;
-    ok_msg(format!("Total number of records: {}", processed_events.fmt()));
+    ok_msg(format!("Processed records: {}", processed_events.fmt()));
 
     if processed_events != filtered_events {
         ok_msg(format!(
